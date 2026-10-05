@@ -131,6 +131,7 @@ always opt-in.
 | `windows-runner` | `windows-latest` | `runs-on` for the Windows job. |
 | `artifact-name` | repository name | Prefix of every artifact file: `<name>-1.4.0+12.ipa`, `<name>-macos-1.4.0+12.zip`. |
 | `java-version` | `17` | JDK for the Android build. |
+| `env-file` | empty | A file the app bundles but doesn't commit, such as `.env`, relative to `working-directory`. Each build job writes the `ENV_FILE` secret into it before building, and deletes it when the job ends. |
 | `enforce-lockfile` | `true` | Install with `flutter pub get --enforce-lockfile`. Set `false` if the app does not commit `pubspec.lock`. Not applied to the iOS job, whose dependencies are installed inside `crianpiro/build_flutter_app`. |
 | `refresh-cocoapods` | `true` | Run `pod repo update` before the macOS build. A stale index reports "could not find compatible versions for pod X", which reads like a dependency conflict. |
 | `uses-non-exempt-encryption` | `false` | The export-compliance answer posted to App Store Connect. |
@@ -197,9 +198,10 @@ build-version distribute-ios distribute-android
 flavor: prod
 ```
 
-A commit that names no flavor, or one the app does not have, fails before
-anything builds. There is deliberately no default flavor: a release built from
-the wrong one would still consume the version.
+A commit that names a flavor the app doesn't have fails before anything
+builds, and so does one that names none, unless the caller sets a
+`default-flavor` on `resolve-flavor`. Leave that unset when no flavor is the
+obvious one: a release built from the wrong flavor still consumes the version.
 
 ### What a flavored release produces
 
@@ -255,6 +257,7 @@ jobs:
         uses: crianpiro/flutter_release_pipeline/.github/actions/resolve-flavor@v1
         with:
           flavors: dev, prod
+          # default-flavor: prod   # for commits that name no flavor
 
   pipeline:
     needs: flavor
@@ -270,6 +273,8 @@ jobs:
       P12_PASSWORD: ${{ secrets[format('P12_PASSWORD_{0}', needs.flavor.outputs.suffix)] || secrets.P12_PASSWORD }}
       PROVISIONING_PROFILE_BASE64: ${{ secrets[format('PROVISIONING_PROFILE_BASE64_{0}', needs.flavor.outputs.suffix)] || secrets.PROVISIONING_PROFILE_BASE64 }}
       EXPORT_OPTIONS: ${{ secrets[format('EXPORT_OPTIONS_{0}', needs.flavor.outputs.suffix)] || secrets.EXPORT_OPTIONS }}
+      # Only with the env-file input:
+      # ENV_FILE: ${{ secrets[format('ENV_FILE_{0}', needs.flavor.outputs.suffix)] || secrets.ENV_FILE }}
       RUNNER_KEYCHAIN_PASSWORD: ${{ secrets.RUNNER_KEYCHAIN_PASSWORD }}
       KEYSTORE_BASE64: ${{ secrets[format('KEYSTORE_BASE64_{0}', needs.flavor.outputs.suffix)] || secrets.KEYSTORE_BASE64 }}
       KEYSTORE_PASSWORD: ${{ secrets[format('KEYSTORE_PASSWORD_{0}', needs.flavor.outputs.suffix)] || secrets.KEYSTORE_PASSWORD }}
@@ -341,6 +346,7 @@ missing.
 | Secret | Needed for |
 |---|---|
 | `GIT_TOKEN` | `flutter pub get` fetching private Git dependencies on github.com (read access is enough). |
+| `ENV_FILE` | The contents of the `env-file` file, written byte for byte. Required when `env-file` is set. |
 | `P12_BASE64`, `P12_PASSWORD` | iOS distribution certificate. |
 | `PROVISIONING_PROFILE_BASE64` | iOS provisioning profile. |
 | `EXPORT_OPTIONS` | Contents of `ios/ExportOptions.plist`. |

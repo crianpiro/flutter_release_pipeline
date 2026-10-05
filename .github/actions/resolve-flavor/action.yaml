@@ -23,6 +23,12 @@ inputs:
       without flavors, which then refuses a commit that names one.
     required: false
     default: ""
+  default-flavor:
+    description: >-
+      The flavor a release commit gets when it names none. Must be one of
+      `flavors`. Empty, the default, makes every release name its flavor.
+    required: false
+    default: ""
 
 outputs:
   flavor:
@@ -42,6 +48,7 @@ runs:
       env:
         COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
         FLAVORS: ${{ inputs.flavors }}
+        DEFAULT_FLAVOR: ${{ inputs.default-flavor }}
       run: |
         set -euo pipefail
 
@@ -60,14 +67,28 @@ runs:
                sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]*,[[:space:]]*/,/g')
 
         if [[ -z "$list" ]]; then
+          if [[ -n "$DEFAULT_FLAVOR" ]]; then
+            echo "::error::default-flavor is '$DEFAULT_FLAVOR', but no flavors are listed."
+            exit 1
+          fi
           if [[ -n "$named" ]]; then
             echo "::error::The commit names flavor '$named', but this app is configured without flavors."
             exit 1
           fi
         else
-          # Every release of a flavored app is a release of one flavor, so
-          # there is no default to fall back on: building the wrong flavor
-          # under the right version would consume the version for nothing.
+          # The default is checked against the list even when the commit
+          # names a flavor, so a typo in it fails the first release rather
+          # than the first release that relies on it.
+          if [[ -n "$DEFAULT_FLAVOR" && ",$list," != *",$DEFAULT_FLAVOR,"* ]]; then
+            echo "::error::default-flavor '$DEFAULT_FLAVOR' is not one of this app's flavors: ${list//,/, }."
+            exit 1
+          fi
+
+          # Every release of a flavored app is a release of one flavor. An app
+          # may name a default for commits that say nothing; without one, a
+          # commit has to, because building the wrong flavor under the right
+          # version would consume the version for nothing.
+          named=${named:-$DEFAULT_FLAVOR}
           if [[ -z "$named" ]]; then
             echo "::error::Name the flavor to release in the commit message, as \"flavor: <name>\". This app's flavors: ${list//,/, }."
             exit 1

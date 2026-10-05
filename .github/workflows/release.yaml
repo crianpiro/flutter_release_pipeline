@@ -78,6 +78,13 @@ on:
         description: JDK used for the Android build.
         type: string
         default: "17"
+      env-file:
+        description: >-
+          A file the app bundles but does not commit, such as ".env", relative
+          to working-directory. Each build job writes the ENV_FILE secret into
+          it before building and deletes it afterwards. Empty for none.
+        type: string
+        default: ""
       enforce-lockfile:
         description: >-
           Install with `flutter pub get --enforce-lockfile`, so a build uses
@@ -100,6 +107,9 @@ on:
     secrets:
       GIT_TOKEN:
         description: Optional. Read access to private Git dependencies fetched by `flutter pub get`.
+        required: false
+      ENV_FILE:
+        description: The contents of the env-file input's file. Required when env-file is set.
         required: false
       P12_BASE64:
         required: false
@@ -232,6 +242,8 @@ jobs:
           ANDROID_ENABLED: ${{ inputs.android }}
           ARTIFACT_NAME: ${{ inputs.artifact-name }}
           TAG_PREFIX: ${{ inputs.tag-prefix }}
+          ENV_FILE_PATH: ${{ inputs.env-file }}
+          ENV_FILE_SET: ${{ secrets.ENV_FILE != '' }}
           FLAVOR: ${{ inputs.flavor }}
           TARGET: ${{ inputs.target }}
           DEFAULT_GROUPS: ${{ inputs.default-firebase-groups }}
@@ -272,6 +284,20 @@ jobs:
           if [[ ! "${TAG_PREFIX//\{flavor\}/}" =~ ^[A-Za-z0-9._/-]*$ ]]; then
             echo "::error::tag-prefix may contain only letters, digits, '.', '_', '/' and '-'; read '$TAG_PREFIX'."
             exit 1
+          fi
+
+          # The env file is written by every build job, so a missing secret or
+          # a path outside the app is caught here, before any of them starts.
+          # Only the path is checked; the contents are the app's business.
+          if [[ -n "$ENV_FILE_PATH" ]]; then
+            if [[ "$ENV_FILE_PATH" == /* || "/$ENV_FILE_PATH/" == */../* ]]; then
+              echo "::error::env-file must be a path inside working-directory; read '$ENV_FILE_PATH'."
+              exit 1
+            fi
+            if [[ "$ENV_FILE_SET" != true ]]; then
+              echo "::error::env-file is '$ENV_FILE_PATH' but the ENV_FILE secret is empty. Pass the file's contents as ENV_FILE."
+              exit 1
+            fi
           fi
 
           # The flavor reaches file names, a git ref and Gradle, which takes
@@ -531,6 +557,19 @@ jobs:
           mv "$tmp" pubspec.yaml
           grep '^version:' pubspec.yaml
 
+      # The app bundles a file it does not commit -- typically a .env with
+      # endpoints and keys -- so it is written from a secret before the
+      # build reads it. printf, not echo, so the contents arrive unaltered.
+      - name: Write the env file
+        if: ${{ inputs.env-file != '' }}
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+          ENV_FILE_PATH: ${{ inputs.env-file }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$ENV_FILE_PATH")"
+          printf '%s' "$ENV_FILE" > "$ENV_FILE_PATH"
+
       # The Flutter setup that needs yq runs inside build_flutter_app, not
       # here, but GITHUB_PATH set by an earlier step applies to a composite
       # action's steps too, so installing it now is enough.
@@ -574,6 +613,14 @@ jobs:
           name: ${{ env.IOS_ARTIFACT_NAME }}
           path: ${{ env.IOS_ARTIFACT_NAME }}
 
+      # A self-hosted runner keeps its workspace between runs, and the env
+      # file holds secrets, so it goes as soon as the job ends -- failed or not.
+      - name: Remove the env file
+        if: ${{ always() && inputs.env-file != '' }}
+        env:
+          ENV_FILE_PATH: ${{ inputs.env-file }}
+        run: rm -f "$ENV_FILE_PATH"
+
   build_android_artifact:
     name: Build Android artifact
     needs: resolve
@@ -605,6 +652,19 @@ jobs:
           sed -E "s/^version:.*/version: ${VERSION}+${BUILD_NUMBER}/" pubspec.yaml > "$tmp"
           mv "$tmp" pubspec.yaml
           grep '^version:' pubspec.yaml
+
+      # The app bundles a file it does not commit -- typically a .env with
+      # endpoints and keys -- so it is written from a secret before the
+      # build reads it. printf, not echo, so the contents arrive unaltered.
+      - name: Write the env file
+        if: ${{ inputs.env-file != '' }}
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+          ENV_FILE_PATH: ${{ inputs.env-file }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$ENV_FILE_PATH")"
+          printf '%s' "$ENV_FILE" > "$ENV_FILE_PATH"
 
       # Fails here, naming what is missing, rather than as a Gradle error that
       # does not say which secret the caller forgot to pass.
@@ -705,6 +765,14 @@ jobs:
           name: ${{ env.ANDROID_ARTIFACT_NAME }}
           path: ${{ env.ANDROID_ARTIFACT_NAME }}
 
+      # A self-hosted runner keeps its workspace between runs, and the env
+      # file holds secrets, so it goes as soon as the job ends -- failed or not.
+      - name: Remove the env file
+        if: ${{ always() && inputs.env-file != '' }}
+        env:
+          ENV_FILE_PATH: ${{ inputs.env-file }}
+        run: rm -f "$ENV_FILE_PATH"
+
   build_macos_artifact:
     name: Build macOS artifact
     needs: resolve
@@ -736,6 +804,19 @@ jobs:
           sed -E "s/^version:.*/version: ${VERSION}+${BUILD_NUMBER}/" pubspec.yaml > "$tmp"
           mv "$tmp" pubspec.yaml
           grep '^version:' pubspec.yaml
+
+      # The app bundles a file it does not commit -- typically a .env with
+      # endpoints and keys -- so it is written from a secret before the
+      # build reads it. printf, not echo, so the contents arrive unaltered.
+      - name: Write the env file
+        if: ${{ inputs.env-file != '' }}
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+          ENV_FILE_PATH: ${{ inputs.env-file }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$ENV_FILE_PATH")"
+          printf '%s' "$ENV_FILE" > "$ENV_FILE_PATH"
 
       - name: Ensure yq is available
         uses: crianpiro/flutter_release_pipeline/.github/actions/ensure-yq@v1
@@ -792,6 +873,14 @@ jobs:
           name: ${{ env.MACOS_ARTIFACT_NAME }}
           path: ${{ env.MACOS_ARTIFACT_NAME }}
 
+      # A self-hosted runner keeps its workspace between runs, and the env
+      # file holds secrets, so it goes as soon as the job ends -- failed or not.
+      - name: Remove the env file
+        if: ${{ always() && inputs.env-file != '' }}
+        env:
+          ENV_FILE_PATH: ${{ inputs.env-file }}
+        run: rm -f "$ENV_FILE_PATH"
+
   build_windows_artifact:
     name: Build Windows artifact
     needs: resolve
@@ -822,6 +911,19 @@ jobs:
           sed -E "s/^version:.*/version: ${VERSION}+${BUILD_NUMBER}/" pubspec.yaml > "$tmp"
           mv "$tmp" pubspec.yaml
           grep '^version:' pubspec.yaml
+
+      # The app bundles a file it does not commit -- typically a .env with
+      # endpoints and keys -- so it is written from a secret before the
+      # build reads it. printf, not echo, so the contents arrive unaltered.
+      - name: Write the env file
+        if: ${{ inputs.env-file != '' }}
+        env:
+          ENV_FILE: ${{ secrets.ENV_FILE }}
+          ENV_FILE_PATH: ${{ inputs.env-file }}
+        run: |
+          set -euo pipefail
+          mkdir -p "$(dirname "$ENV_FILE_PATH")"
+          printf '%s' "$ENV_FILE" > "$ENV_FILE_PATH"
 
       # A no-op on the hosted image, which ships yq; here for a self-hosted
       # Windows runner, which likely does not.
@@ -879,6 +981,14 @@ jobs:
         with:
           name: ${{ env.WINDOWS_ARTIFACT_NAME }}
           path: ${{ env.WINDOWS_ARTIFACT_NAME }}
+
+      # A self-hosted runner keeps its workspace between runs, and the env
+      # file holds secrets, so it goes as soon as the job ends -- failed or not.
+      - name: Remove the env file
+        if: ${{ always() && inputs.env-file != '' }}
+        env:
+          ENV_FILE_PATH: ${{ inputs.env-file }}
+        run: rm -f "$ENV_FILE_PATH"
 
   distribute_artifact_to_firebase:
     name: Distribute Android to Firebase
