@@ -1,0 +1,60 @@
+# subosito/flutter-action parses pubspec.yaml whenever it is given
+# flutter-version-file, and it does that by shelling out to yq. The
+# GitHub-hosted runner images ship yq; self-hosted runners usually do not, and
+# the action then aborts with "yq not found" before downloading anything.
+#
+# Installing yq is the fix that keeps pubspec.yaml the single source of truth
+# for the Flutter version. Pinning flutter-version in the workflow instead
+# would avoid the YAML parsing altogether, at the cost of writing the version
+# in two places that then drift.
+#
+# This lives as an action rather than as a step pasted into every build job so
+# that the pinned version below exists exactly once.
+
+name: Ensure yq
+description: Put yq on PATH for the rest of the job, if the runner does not already provide it.
+
+runs:
+  using: composite
+  steps:
+    - shell: bash
+      run: |
+        set -euo pipefail
+
+        # A runner that has yq of its own -- installed system-wide later, or
+        # a GitHub-hosted image -- supersedes this silently.
+        if command -v yq >/dev/null 2>&1; then
+          echo "[INFO] yq already present: $(command -v yq)"
+          exit 0
+        fi
+
+        # The build jobs run on Linux, macOS and Windows machines alike.
+        exe=""
+        case "$(uname -s)" in
+          Darwin)               os=darwin ;;
+          MINGW*|MSYS*|CYGWIN*) os=windows; exe=.exe ;;
+          *)                    os=linux ;;
+        esac
+        case "$(uname -m)" in
+          arm64|aarch64) arch=arm64 ;;
+          *)             arch=amd64 ;;
+        esac
+
+        # Pinned rather than tracking /latest/download: a new yq major
+        # changes the expression syntax, and would break these builds with no
+        # commit here to explain it.
+        bin_dir="$HOME/.local/bin"
+        mkdir -p "$bin_dir"
+        curl -fsSL "https://github.com/mikefarah/yq/releases/download/v4.44.3/yq_${os}_${arch}${exe}" \
+          -o "$bin_dir/yq$exe"
+        chmod +x "$bin_dir/yq$exe"
+
+        # GITHUB_PATH applies to every later step of the job, including the
+        # steps inside a composite action it calls -- which is how the iOS
+        # job reaches flutter-action inside crianpiro/build_flutter_app.
+        # The runner reads it as a native path, so Windows needs it converted.
+        if [[ "$os" == windows ]]; then
+          bin_dir=$(cygpath -w "$bin_dir")
+        fi
+        echo "$bin_dir" >> "$GITHUB_PATH"
+        echo "[INFO] yq installed for $os/$arch"

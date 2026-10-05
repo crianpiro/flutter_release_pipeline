@@ -1,0 +1,967 @@
+# Builds a Flutter app and, on request, ships it to testers -- driven entirely
+# by keywords in the commit message. See README.md for the keyword reference,
+# the inputs and secrets, and what the calling app has to provide.
+#
+# This is a reusable workflow: an app repository calls it from a workflow of
+# its own that runs on push, and keeps nothing else. Every value that differs
+# between apps is an input or a secret; everything below is shared.
+#
+# Two things the caller must do, because a called workflow cannot do them for
+# itself:
+#
+#   * grant `permissions: contents: write` -- the release job pushes the
+#     version bump and the tag, and a called workflow can only narrow the
+#     permissions it is given, never widen them.
+#   * declare the concurrency group. Two releases racing for the same version
+#     is a property of the app repository, so the guard belongs there.
+
+name: "Build & distribute"
+
+on:
+  workflow_call:
+    inputs:
+      ios:
+        description: Build the IPA on a release. False for an app with no iOS target.
+        type: boolean
+        default: true
+      android:
+        description: Build the APK on a release. False for an app with no Android target.
+        type: boolean
+        default: true
+      linux-runner:
+        description: >-
+          runs-on for the Linux jobs. A label ("ubuntu-latest") or a JSON
+          object/array ('{"group":"x","labels":["self-hosted","Linux"]}').
+        type: string
+        default: ubuntu-latest
+      macos-runner:
+        description: runs-on for the macOS jobs, in the same form as linux-runner.
+        type: string
+        default: macos-latest
+      windows-runner:
+        description: runs-on for the Windows job, in the same form as linux-runner.
+        type: string
+        default: windows-latest
+      artifact-name:
+        description: Prefix of every artifact file name. Defaults to the repository name.
+        type: string
+        default: ""
+      java-version:
+        description: JDK used for the Android build.
+        type: string
+        default: "17"
+      enforce-lockfile:
+        description: >-
+          Install with `flutter pub get --enforce-lockfile`, so a build uses
+          exactly the committed pubspec.lock. False for an app that does not
+          commit its lockfile.
+        type: boolean
+        default: true
+      refresh-cocoapods:
+        description: Run `pod repo update` before the macOS build.
+        type: boolean
+        default: true
+      uses-non-exempt-encryption:
+        description: The App Store Connect export-compliance answer for each build.
+        type: boolean
+        default: false
+      default-firebase-groups:
+        description: Firebase tester group aliases used when the commit names no "groups:" line.
+        type: string
+        default: default
+    secrets:
+      GIT_TOKEN:
+        description: Optional. Read access to private Git dependencies fetched by `flutter pub get`.
+        required: false
+      P12_BASE64:
+        required: false
+      P12_PASSWORD:
+        required: false
+      PROVISIONING_PROFILE_BASE64:
+        required: false
+      EXPORT_OPTIONS:
+        required: false
+      RUNNER_KEYCHAIN_PASSWORD:
+        required: false
+      KEYSTORE_BASE64:
+        required: false
+      KEYSTORE_PASSWORD:
+        required: false
+      KEY_PASSWORD:
+        required: false
+      KEY_ALIAS:
+        required: false
+      FIREBASE_ANDROID_APP_ID:
+        required: false
+      FIREBASE_DISTRIBUTION_SERVICE_ACCOUNT:
+        required: false
+      APPLE_API_KEY_ID:
+        required: false
+      APPLE_API_KEY_ISSUER_ID:
+        required: false
+      APPLE_API_KEY_BASE64:
+        required: false
+    outputs:
+      version:
+        description: The version this run built, X.Y.Z.
+        value: ${{ jobs.resolve.outputs.version }}
+      build_number:
+        description: The build number this run built.
+        value: ${{ jobs.resolve.outputs.build_number }}
+      release_requested:
+        description: Whether the commit asked for a release ("build-version").
+        value: ${{ jobs.resolve.outputs.release_requested }}
+
+# Git configuration for every job, supplied through the environment so that it
+# reaches git wherever it runs -- including inside actions/checkout and inside
+# the steps of the composite actions those jobs call. It has to live here: a
+# caller's `env:` does not carry into a called workflow.
+#
+# credential.helper is reset to empty (which clears the list rather than adding
+# to it) because Xcode ships
+# /Applications/Xcode.app/Contents/Developer/usr/share/git-core/gitconfig with
+# `helper = osxkeychain`. On a runner with no GUI login session, that helper
+# blocks forever on a keychain unlock prompt nobody can answer -- and it does so
+# on `store`, after the fetch has already succeeded, so the symptom is a job
+# that hangs having apparently done nothing wrong. It comes back with every
+# Xcode update, so it is overridden here rather than on the runner.
+#
+# The replacement helper answers for github.com out of GIT_TOKEN, which the
+# build jobs put in the environment, and answers nothing when it is unset.
+# Reading the token at call time keeps it out of the remote URL, and therefore
+# out of the process table where any local user can `ps` it, and out of the
+# runner's persistent global .gitconfig.
+#
+# GIT_TERMINAL_PROMPT stops git waiting on a prompt it can never receive: a
+# missing or rejected credential then fails in seconds with a readable error
+# instead of hanging until the job is cancelled.
+env:
+  GIT_TERMINAL_PROMPT: "0"
+  GIT_CONFIG_COUNT: "2"
+  GIT_CONFIG_KEY_0: credential.helper
+  GIT_CONFIG_VALUE_0: ""
+  GIT_CONFIG_KEY_1: credential.https://github.com.helper
+  GIT_CONFIG_VALUE_1: '!f() { if test "$1" = get && test -n "${GIT_TOKEN:-}"; then printf "username=x-access-token\npassword=%s\n" "$GIT_TOKEN"; fi; }; f'
+
+jobs:
+  resolve:
+    name: Resolve version
+    # Either keyword starts a run. Neither contains the other as a substring,
+    # so "build-desktop-version" alone never releases, and "build-version"
+    # alone never builds desktop. `github` is the caller's context here, so
+    # this is the commit that triggered the app repository's workflow.
+    if: >-
+      contains(github.event.head_commit.message, 'build-version') ||
+      contains(github.event.head_commit.message, 'build-desktop-version')
+    runs-on: ${{ (startsWith(inputs.linux-runner, '{') || startsWith(inputs.linux-runner, '[')) && fromJSON(inputs.linux-runner) || inputs.linux-runner }}
+    permissions:
+      contents: read
+    outputs:
+      version: ${{ steps.version.outputs.version }}
+      build_number: ${{ steps.version.outputs.build_number }}
+      artifact_name: ${{ steps.version.outputs.artifact_name }}
+      release_notes: ${{ steps.version.outputs.release_notes }}
+      groups: ${{ steps.version.outputs.groups }}
+      release_requested: ${{ steps.version.outputs.release_requested }}
+      build_ios: ${{ steps.version.outputs.build_ios }}
+      build_android: ${{ steps.version.outputs.build_android }}
+      distribute_ios: ${{ steps.version.outputs.distribute_ios }}
+      distribute_android: ${{ steps.version.outputs.distribute_android }}
+      build_macos: ${{ steps.version.outputs.build_macos }}
+      build_windows: ${{ steps.version.outputs.build_windows }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # The version comes from pubspec.yaml, but the guard below checks it
+          # against existing tags, and checkout's default depth-1 clone fetches
+          # no tags at all -- `git tag --list` on a runner comes back empty, so
+          # the guard would pass for every version ever released.
+          # The build jobs need neither tags nor history, so they do not set it.
+          fetch-depth: 0
+
+      - name: Resolve version
+        id: version
+        env:
+          COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+          IOS_ENABLED: ${{ inputs.ios }}
+          ANDROID_ENABLED: ${{ inputs.android }}
+          ARTIFACT_NAME: ${{ inputs.artifact-name }}
+          DEFAULT_GROUPS: ${{ inputs.default-firebase-groups }}
+        run: |
+          set -euo pipefail
+
+          # Keywords are matched on word boundaries, never as bare substrings,
+          # so one keyword can never be found inside a longer one.
+          has() {
+            printf '%s' "$COMMIT_MESSAGE" |
+              grep -qiE "(^|[^-[:alnum:]])$1(\$|[^-[:alnum:]])"
+          }
+
+          # An explicit version may follow the keyword with up to three
+          # separator characters: "build-version 1.4.0", "build-version: 1.4.0"
+          # and "build-version(1.4.0)" all pin 1.4.0.
+          version=$(
+            printf '%s' "$COMMIT_MESSAGE" \
+              | grep -oiE 'build-version[^0-9]{0,3}[0-9]+\.[0-9]+\.[0-9]+' \
+              | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+              | head -1 \
+              || true
+          )
+
+          # pubspec.yaml is the source of truth, so both the fallback and the
+          # build number are derived from what it already says.
+          current=$(grep -m1 '^version:' pubspec.yaml | sed -E 's/^version:[[:space:]]*//')
+          current_version=${current%%+*}
+          current_build=${current##*+}
+          if [[ ! "$current_version" =~ ^[0-9]+\.[0-9]+\.[0-9]+$ || ! "$current_build" =~ ^[0-9]+$ ]]; then
+            echo "::error::Cannot read a version of the form X.Y.Z+N from pubspec.yaml (found '$current')."
+            exit 1
+          fi
+
+          # "build-version" is what asks for a release: the version bump, the
+          # mobile artifacts, the tag and the GitHub release. Without it this
+          # run only builds desktop, and must leave the version alone -- see
+          # the branch below.
+          if has 'build-version'; then release_requested=true; else release_requested=false; fi
+
+          if [[ "$release_requested" == true ]]; then
+            # Without an explicit version, bump the patch of the one in pubspec.
+            # A minor or major release is named in the commit message instead --
+            # that keeps one rule here rather than three keywords.
+            if [[ -z "$version" ]]; then
+              IFS=. read -r major minor patch <<<"$current_version"
+              version="$major.$minor.$((patch + 1))"
+            fi
+
+            # The build number always moves, including when the version is named
+            # explicitly: App Store Connect refuses a build number it has already
+            # seen, for that version, permanently.
+            build_number=$((current_build + 1))
+
+            if [[ "$version" == "$current_version" ]]; then
+              echo "::error::pubspec.yaml is already at $version. Name a different version in the commit message."
+              exit 1
+            fi
+
+            if existing=$(git rev-list -n1 "v$version" 2>/dev/null); then
+              echo "::error::v$version already tags ${existing:0:7}. Name a different version in the commit message."
+              exit 1
+            fi
+          else
+            # A desktop-only run publishes nothing and must not consume a
+            # version number, because the next release derives its own from
+            # what pubspec.yaml says. So it builds exactly what is already
+            # there, and the two guards above are deliberately skipped: pubspec
+            # IS at this version, and this version IS already tagged -- both
+            # are correct here rather than errors.
+            version=$current_version
+            build_number=$current_build
+          fi
+
+          # Mobile is opt-out per app, through the `ios` and `android` inputs:
+          # a release builds every mobile platform the app has. It is not a
+          # per-commit choice, because the release always carries the full set.
+          build_ios=false
+          build_android=false
+          if [[ "$release_requested" == true ]]; then
+            build_ios=$IOS_ENABLED
+            build_android=$ANDROID_ENABLED
+          fi
+
+          # Desktop is opt-in, and builds both platforms unless exactly one is
+          # named. Naming both asks for what the default already does, so it is
+          # the same as naming neither rather than an error.
+          if has 'build-desktop-version'; then
+            if has 'desktop-macos'; then macos_named=true; else macos_named=false; fi
+            if has 'desktop-windows'; then windows_named=true; else windows_named=false; fi
+            if [[ "$macos_named" == "$windows_named" ]]; then
+              build_macos=true
+              build_windows=true
+            else
+              build_macos=$macos_named
+              build_windows=$windows_named
+            fi
+          else
+            build_macos=false
+            build_windows=false
+          fi
+
+          # A release with no artifact would tag and publish an empty release.
+          if [[ "$release_requested" == true && "$build_ios$build_android$build_macos$build_windows" != *true* ]]; then
+            echo "::error::This app builds neither iOS nor Android, so a release needs \"build-desktop-version\" as well -- otherwise it would publish nothing."
+            exit 1
+          fi
+
+          # Distribution is opt-in and per platform. Neither keyword contains
+          # the other, so a commit can ask for either or both.
+          if has 'distribute-ios'; then distribute_ios=true; else distribute_ios=false; fi
+          if has 'distribute-android'; then distribute_android=true; else distribute_android=false; fi
+
+          # Asking to ship a platform this app does not build is a
+          # misunderstanding, and silently shipping nothing would hide it.
+          if [[ "$distribute_ios" == true && "$IOS_ENABLED" != true ]]; then
+            echo "::error::distribute-ios was asked for, but this app is configured with ios: false."
+            exit 1
+          fi
+          if [[ "$distribute_android" == true && "$ANDROID_ENABLED" != true ]]; then
+            echo "::error::distribute-android was asked for, but this app is configured with android: false."
+            exit 1
+          fi
+
+          # Tester groups for Firebase. "groups: qa, management" anywhere in the
+          # commit message names them for this release; the list runs to the end
+          # of that line. Without it the build goes to the configured default.
+          group_line=$(printf '%s' "$COMMIT_MESSAGE" | grep -oiE '(^|[^-[:alnum:]])groups:[[:print:]]*' | head -1 || true)
+          # Only whitespace around the commas is dropped, never whitespace
+          # inside an entry -- otherwise a line of prose after "groups:" would
+          # collapse into one plausible-looking alias and fail at upload time
+          # instead of here.
+          groups=$(printf '%s' "${group_line#*:}" |
+                   sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]*,[[:space:]]*/,/g')
+          groups=${groups:-$DEFAULT_GROUPS}
+          if [[ ! "$groups" =~ ^[A-Za-z0-9_-]+(,[A-Za-z0-9_-]+)*$ ]]; then
+            echo "::error::\"groups:\" must be a comma-separated list of Firebase group aliases; read '$groups'."
+            exit 1
+          fi
+
+          # "distribute-ios 1.0.5" alongside "build-version 1.0.7" is someone
+          # expecting to ship a different version than the one being built.
+          # This ships what it builds, so that has to be an error rather than a
+          # quiet surprise. The same applies to "build-desktop-version": the
+          # desktop artifacts carry the version this run resolved, so naming
+          # another one is a misunderstanding worth failing on.
+          for keyword in distribute-ios distribute-android build-desktop-version; do
+            requested=$(
+              printf '%s' "$COMMIT_MESSAGE" \
+                | grep -oiE "${keyword}[^0-9]{0,3}[0-9]+\.[0-9]+\.[0-9]+" \
+                | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
+                | head -1 \
+                || true
+            )
+            if [[ -n "$requested" && "$requested" != "$version" ]]; then
+              echo "::error::$keyword names $requested but this run builds $version. A run builds one version, and every keyword in the message refers to it."
+              exit 1
+            fi
+          done
+
+          # Every artifact file name starts with this, so it must not carry
+          # anything a path or a release asset name would trip over.
+          artifact_name=${ARTIFACT_NAME:-${GITHUB_REPOSITORY#*/}}
+          if [[ ! "$artifact_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
+            echo "::error::artifact-name may contain only letters, digits, '.', '_' and '-'; read '$artifact_name'."
+            exit 1
+          fi
+
+          {
+            echo "version=$version"
+            echo "build_number=$build_number"
+            echo "artifact_name=$artifact_name"
+            echo "groups=$groups"
+            echo "release_requested=$release_requested"
+            echo "build_ios=$build_ios"
+            echo "build_android=$build_android"
+            echo "distribute_ios=$distribute_ios"
+            echo "distribute_android=$distribute_android"
+            echo "build_macos=$build_macos"
+            echo "build_windows=$build_windows"
+          } >> "$GITHUB_OUTPUT"
+
+          # Release notes are the commit body -- on a squash merge that is the
+          # pull request description, which is what testers should read. The
+          # subject line is the fallback, and it is the line carrying the
+          # keyword, so the body is preferred wherever there is one.
+          notes=$(printf '%s' "$COMMIT_MESSAGE" | tail -n +2 | sed '/^[[:space:]]*$/d')
+          if [[ -z "$notes" ]]; then
+            notes=$(printf '%s' "$COMMIT_MESSAGE" | head -1)
+          fi
+          {
+            echo "release_notes<<GHEOF"
+            echo "$notes"
+            echo ""
+            echo "Version: $version+$build_number"
+            echo "GHEOF"
+          } >> "$GITHUB_OUTPUT"
+
+          # "A and B", "A", or "" -- for the one-line summary below.
+          join() {
+            if [[ -n "$1" && -n "$2" ]]; then echo "$1 and $2"; else echo "$1$2"; fi
+          }
+          targets=$(join "$([[ $distribute_ios == true ]] && echo 'App Store Connect')" \
+                         "$([[ $distribute_android == true ]] && echo 'Firebase')")
+          mobile=$(join "$([[ $build_ios == true ]] && echo 'iOS')" \
+                        "$([[ $build_android == true ]] && echo 'Android')")
+          desktop=$(join "$([[ $build_macos == true ]] && echo 'macOS')" \
+                         "$([[ $build_windows == true ]] && echo 'Windows')")
+
+          if [[ "$release_requested" != true ]]; then
+            # Nothing is bumped, tagged or released, so the summary says which
+            # version the artifacts carry -- it is the one already released,
+            # and that is easy to misread as a new one.
+            echo "Building desktop **v$version+$build_number** ($desktop) from \`${GITHUB_SHA:0:7}\` — artifacts attach to this run; nothing is bumped, tagged or released" >> "$GITHUB_STEP_SUMMARY"
+          else
+            line="Building **v$version+$build_number** ($(join "$mobile" "$desktop")) from \`${GITHUB_SHA:0:7}\`"
+            if [[ -n "$targets" ]]; then
+              echo "$line, distributing to $targets" >> "$GITHUB_STEP_SUMMARY"
+            elif [[ -n "$mobile" ]]; then
+              echo "$line — no distribution (add \`distribute-ios\` and/or \`distribute-android\` to ship it)" >> "$GITHUB_STEP_SUMMARY"
+            else
+              echo "$line" >> "$GITHUB_STEP_SUMMARY"
+            fi
+          fi
+
+  build_ios_artifact:
+    name: Build iOS artifact
+    needs: resolve
+    if: ${{ needs.resolve.outputs.build_ios == 'true' }}
+    runs-on: ${{ (startsWith(inputs.macos-runner, '{') || startsWith(inputs.macos-runner, '[')) && fromJSON(inputs.macos-runner) || inputs.macos-runner }}
+    outputs:
+      ios_artifact_name: ${{ steps.prepare_ios_artifact.outputs.ios_artifact_name }}
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
+      ARTIFACT_NAME: ${{ needs.resolve.outputs.artifact_name }}
+      # Read by the credential helper defined at the top of this file, when
+      # `flutter pub get` fetches private Git dependencies.
+      GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Written into the workspace pubspec so the IPA carries it. The release
+      # job writes the same line again and commits it; this copy is throwaway.
+      # `sed -i` is spelled differently on BSD and GNU sed and these jobs run
+      # on macOS, Linux and Windows, so neither spelling is used.
+      - name: Set the build version
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp)
+          sed -E "s/^version:.*/version: ${VERSION}+${BUILD_NUMBER}/" pubspec.yaml > "$tmp"
+          mv "$tmp" pubspec.yaml
+          grep '^version:' pubspec.yaml
+
+      # The Flutter setup that needs yq runs inside build_flutter_app, not
+      # here, but GITHUB_PATH set by an earlier step applies to a composite
+      # action's steps too, so installing it now is enough.
+      #
+      # A called workflow cannot reach its own repository's actions with a
+      # relative path -- `./` is the caller's checkout -- so this names the
+      # repository and the major version tag. Move it with every new major.
+      - name: Ensure yq is available
+        uses: crianpiro/flutter_release_pipeline/.github/actions/ensure-yq@v1
+
+      # build_flutter_app runs its own `flutter pub get` and has no option to
+      # enforce the lockfile, so `enforce-lockfile` does not reach this job.
+      - name: Build iOS artifact
+        uses: crianpiro/build_flutter_app@v2
+        with:
+          working-directory: ./
+          certificate-base64: ${{ secrets.P12_BASE64 }}
+          certificate-password: ${{ secrets.P12_PASSWORD }}
+          provisioning-profile-base64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
+          keychain-password: ${{ secrets.RUNNER_KEYCHAIN_PASSWORD }}
+          export-options-plist: ${{ secrets.EXPORT_OPTIONS }}
+
+      - name: Prepare iOS artifact
+        id: prepare_ios_artifact
+        run: |
+          set -euo pipefail
+          IPA_NAME=${ARTIFACT_NAME}-${VERSION}+${BUILD_NUMBER}.ipa
+          IPA_PATH=build/ios/ipa/$IPA_NAME
+          mv build/ios/ipa/app-release.ipa "$IPA_PATH"
+          echo "IOS_ARTIFACT_PATH=$IPA_PATH" >> "$GITHUB_ENV"
+          echo "IOS_ARTIFACT_NAME=$IPA_NAME" >> "$GITHUB_ENV"
+          echo "ios_artifact_name=$IPA_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact to GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.IOS_ARTIFACT_NAME }}
+          path: ${{ env.IOS_ARTIFACT_PATH }}
+
+  build_android_artifact:
+    name: Build Android artifact
+    needs: resolve
+    if: ${{ needs.resolve.outputs.build_android == 'true' }}
+    runs-on: ${{ (startsWith(inputs.linux-runner, '{') || startsWith(inputs.linux-runner, '[')) && fromJSON(inputs.linux-runner) || inputs.linux-runner }}
+    outputs:
+      android_artifact_name: ${{ steps.prepare_android_artifact.outputs.android_artifact_name }}
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
+      ARTIFACT_NAME: ${{ needs.resolve.outputs.artifact_name }}
+      # Read by the credential helper defined at the top of this file, when
+      # `flutter pub get` fetches private Git dependencies.
+      GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # The version comes out of pubspec.yaml rather than --build-name /
+      # --build-number, so that every platform reads it from the same place.
+      - name: Set the build version
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp)
+          sed -E "s/^version:.*/version: ${VERSION}+${BUILD_NUMBER}/" pubspec.yaml > "$tmp"
+          mv "$tmp" pubspec.yaml
+          grep '^version:' pubspec.yaml
+
+      # Fails here, naming what is missing, rather than as a Gradle error that
+      # does not say which secret the caller forgot to pass.
+      - name: Check signing secrets
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+          KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+        run: |
+          set -euo pipefail
+          missing=()
+          for name in KEYSTORE_BASE64 KEYSTORE_PASSWORD KEY_PASSWORD KEY_ALIAS; do
+            [[ -n "${!name}" ]] || missing+=("$name")
+          done
+          if (( ${#missing[@]} )); then
+            echo "::error::Android signing secrets not passed to the workflow: ${missing[*]}. Pass them, or set android: false."
+            exit 1
+          fi
+
+      - name: Setup Java
+        uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: ${{ inputs.java-version }}
+
+      # flutter-action parses pubspec.yaml with yq, which self-hosted runners
+      # often do not provide. See .github/actions/ensure-yq.
+      - name: Ensure yq is available
+        uses: crianpiro/flutter_release_pipeline/.github/actions/ensure-yq@v1
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version-file: pubspec.yaml
+
+      # With the lockfile enforced, a git dependency resolves to the commit
+      # pubspec.lock pins rather than to wherever its branch points today, and
+      # a lockfile out of step with pubspec.yaml fails here instead of being
+      # quietly rewritten.
+      - name: Install Dependencies
+        run: flutter pub get ${{ inputs.enforce-lockfile && '--enforce-lockfile' || '' }}
+
+      # Decoded under RUNNER_TEMP rather than into the workspace: a self-hosted
+      # runner keeps its workspace between runs, and the keystore is a
+      # credential, while RUNNER_TEMP is emptied when the job ends. base64 uses only [A-Za-z0-9+/=], so nothing here can be
+      # altered by the shell -- unlike the passwords, which is why those take
+      # a different route below. printf rather than echo so no newline is
+      # appended to the input.
+      - name: Decode Keystore
+        env:
+          KEYSTORE_BASE64: ${{ secrets.KEYSTORE_BASE64 }}
+        run: |
+          set -euo pipefail
+          printf '%s' "$KEYSTORE_BASE64" | base64 --decode > "$RUNNER_TEMP/release-keystore.jks"
+
+      # The signing secrets reach Gradle through the environment rather than
+      # through android/key.properties, because everything on that path alters
+      # text. Interpolating a secret into a shell `echo` lets the shell expand
+      # `$` and backticks in it; java.util.Properties treats a backslash as an
+      # escape and drops it; and Properties.load(InputStream) decodes
+      # ISO-8859-1, so a non-ASCII character read back is not the one written.
+      # Every one of those corruptions is silent, and all of them surface only
+      # as "Keystore was tampered with, or password was incorrect" -- which is
+      # indistinguishable from having the wrong password, and cannot be
+      # reproduced locally, where the password is typed at a prompt and passes
+      # through neither a shell nor a properties file.
+      #
+      # The app's android/app/build.gradle(.kts) has to read these four
+      # variables; README.md shows how.
+      #
+      # LANG matters for the same reason: Java decodes environment variables
+      # with sun.jnu.encoding, which follows the process locale. Left unset on
+      # a bare runner that is ASCII, and a non-ASCII password would be mangled
+      # again -- one encoding bug traded for another.
+      - name: Build Android artifact
+        env:
+          ANDROID_KEYSTORE_FILE: ${{ runner.temp }}/release-keystore.jks
+          ANDROID_KEYSTORE_PASSWORD: ${{ secrets.KEYSTORE_PASSWORD }}
+          ANDROID_KEY_PASSWORD: ${{ secrets.KEY_PASSWORD }}
+          ANDROID_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
+          LANG: C.UTF-8
+          LC_ALL: C.UTF-8
+        run: flutter build apk --release
+
+      - name: Prepare Android artifact
+        id: prepare_android_artifact
+        run: |
+          set -euo pipefail
+          APK_NAME=${ARTIFACT_NAME}-${VERSION}+${BUILD_NUMBER}.apk
+          APK_PATH=build/app/outputs/flutter-apk/$APK_NAME
+          mv build/app/outputs/flutter-apk/app-release.apk "$APK_PATH"
+          echo "ANDROID_ARTIFACT_PATH=$APK_PATH" >> "$GITHUB_ENV"
+          echo "ANDROID_ARTIFACT_NAME=$APK_NAME" >> "$GITHUB_ENV"
+          echo "android_artifact_name=$APK_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact to GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.ANDROID_ARTIFACT_NAME }}
+          path: ${{ env.ANDROID_ARTIFACT_PATH }}
+
+  build_macos_artifact:
+    name: Build macOS artifact
+    needs: resolve
+    if: ${{ needs.resolve.outputs.build_macos == 'true' }}
+    runs-on: ${{ (startsWith(inputs.macos-runner, '{') || startsWith(inputs.macos-runner, '[')) && fromJSON(inputs.macos-runner) || inputs.macos-runner }}
+    outputs:
+      macos_artifact_name: ${{ steps.prepare_macos_artifact.outputs.macos_artifact_name }}
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
+      ARTIFACT_NAME: ${{ needs.resolve.outputs.artifact_name }}
+      GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      # Same as the mobile jobs: the version reaches the build through
+      # pubspec.yaml rather than --build-name, so every platform reads it from
+      # one place. On a desktop-only run resolve hands back what pubspec
+      # already says, so this rewrites the line with its own value.
+      - name: Set the build version
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp)
+          sed -E "s/^version:.*/version: ${VERSION}+${BUILD_NUMBER}/" pubspec.yaml > "$tmp"
+          mv "$tmp" pubspec.yaml
+          grep '^version:' pubspec.yaml
+
+      - name: Ensure yq is available
+        uses: crianpiro/flutter_release_pipeline/.github/actions/ensure-yq@v1
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version-file: pubspec.yaml
+
+      - name: Install Dependencies
+        run: flutter pub get ${{ inputs.enforce-lockfile && '--enforce-lockfile' || '' }}
+
+      # The macOS pod set resolves from the CocoaPods CDN, and a runner that
+      # has not built an Apple target in a while holds a stale index of it.
+      # The symptom is "could not find compatible versions for pod X" or
+      # "specs repository is too out-of-date", which reads like a dependency
+      # conflict rather than a cache problem and costs an afternoon to
+      # recognise. Refreshing first is cheaper than that.
+      - name: Refresh the CocoaPods spec index
+        if: ${{ inputs.refresh-cocoapods }}
+        run: pod repo update
+
+      - name: Build macOS artifact
+        run: flutter build macos --release
+
+      # The .app is found rather than named, because its name is the app's
+      # PRODUCT_NAME and differs per app. ditto rather than zip: a .app is a
+      # tree of symlinks and executable bits, and zip flattens the symlinks
+      # and drops the permissions, so the unpacked app fails to launch with no
+      # useful error. --keepParent keeps the .app directory itself inside the
+      # archive rather than its contents.
+      - name: Prepare macOS artifact
+        id: prepare_macos_artifact
+        run: |
+          set -euo pipefail
+          products=build/macos/Build/Products/Release
+          apps=()
+          while IFS= read -r app; do apps+=("$app"); done < <(find "$products" -maxdepth 1 -name '*.app' -type d)
+          if (( ${#apps[@]} != 1 )); then
+            echo "::error::Expected exactly one .app in $products, found ${#apps[@]}."
+            ls "$products" || true
+            exit 1
+          fi
+          MACOS_NAME=${ARTIFACT_NAME}-macos-${VERSION}+${BUILD_NUMBER}.zip
+          ditto -c -k --sequesterRsrc --keepParent "${apps[0]}" "$MACOS_NAME"
+          echo "MACOS_ARTIFACT_NAME=$MACOS_NAME" >> "$GITHUB_ENV"
+          echo "macos_artifact_name=$MACOS_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact to GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.MACOS_ARTIFACT_NAME }}
+          path: ${{ env.MACOS_ARTIFACT_NAME }}
+
+  build_windows_artifact:
+    name: Build Windows artifact
+    needs: resolve
+    if: ${{ needs.resolve.outputs.build_windows == 'true' }}
+    runs-on: ${{ (startsWith(inputs.windows-runner, '{') || startsWith(inputs.windows-runner, '[')) && fromJSON(inputs.windows-runner) || inputs.windows-runner }}
+    defaults:
+      run:
+        # The scripts below are POSIX shell, not PowerShell, matching the rest
+        # of this file. Git for Windows provides bash on the hosted image.
+        shell: bash
+    outputs:
+      windows_artifact_name: ${{ steps.prepare_windows_artifact.outputs.windows_artifact_name }}
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
+      ARTIFACT_NAME: ${{ needs.resolve.outputs.artifact_name }}
+      GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
+    steps:
+      - uses: actions/checkout@v4
+
+      - name: Set the build version
+        run: |
+          set -euo pipefail
+          tmp=$(mktemp)
+          sed -E "s/^version:.*/version: ${VERSION}+${BUILD_NUMBER}/" pubspec.yaml > "$tmp"
+          mv "$tmp" pubspec.yaml
+          grep '^version:' pubspec.yaml
+
+      # A no-op on the hosted image, which ships yq; here for a self-hosted
+      # Windows runner, which likely does not.
+      - name: Ensure yq is available
+        uses: crianpiro/flutter_release_pipeline/.github/actions/ensure-yq@v1
+
+      - name: Setup Flutter
+        uses: subosito/flutter-action@v2
+        with:
+          flutter-version-file: pubspec.yaml
+
+      - name: Install Dependencies
+        run: flutter pub get ${{ inputs.enforce-lockfile && '--enforce-lockfile' || '' }}
+
+      # Plugins that ship no Windows binary (objectbox_flutter_libs, for one)
+      # fetch it at CMake configure time, on every clean build -- so this may
+      # need outbound access to github.com, and a locked-down runner fails
+      # here rather than at `pub get`.
+      - name: Build Windows artifact
+        run: flutter build windows --release
+
+      # The runner output is a directory, not a single file: the .exe needs the
+      # Flutter DLLs and the data/ folder beside it or it will not start. The
+      # tree is zipped here rather than handed to upload-artifact as a
+      # directory, so that the release carries one file per platform. The
+      # architecture directory (x64, arm64) is matched rather than assumed.
+      - name: Prepare Windows artifact
+        id: prepare_windows_artifact
+        run: |
+          set -euo pipefail
+          dirs=(build/windows/*/runner/Release)
+          RELEASE_DIR=${dirs[0]}
+          exes=()
+          if [[ -d "$RELEASE_DIR" ]]; then
+            while IFS= read -r exe; do exes+=("$exe"); done < <(find "$RELEASE_DIR" -maxdepth 1 -name '*.exe')
+          fi
+          if (( ${#dirs[@]} != 1 || ${#exes[@]} != 1 )); then
+            echo "::error::Expected one build/windows/<arch>/runner/Release holding exactly one .exe."
+            ls -R build/windows || true
+            exit 1
+          fi
+          WINDOWS_NAME=${ARTIFACT_NAME}-windows-${VERSION}+${BUILD_NUMBER}.zip
+          # -r for the tree, and run from inside it so the archive has no
+          # build/windows/x64/... prefix around the executable.
+          (cd "$RELEASE_DIR" && 7z a -tzip -mx=5 "$GITHUB_WORKSPACE/$WINDOWS_NAME" .) > /dev/null
+          echo "WINDOWS_ARTIFACT_NAME=$WINDOWS_NAME" >> "$GITHUB_ENV"
+          echo "windows_artifact_name=$WINDOWS_NAME" >> "$GITHUB_OUTPUT"
+
+      - name: Upload artifact to GitHub
+        uses: actions/upload-artifact@v4
+        with:
+          name: ${{ env.WINDOWS_ARTIFACT_NAME }}
+          path: ${{ env.WINDOWS_ARTIFACT_NAME }}
+
+  distribute_artifact_to_firebase:
+    name: Distribute Android to Firebase
+    needs: [resolve, build_android_artifact]
+    if: ${{ needs.resolve.outputs.distribute_android == 'true' }}
+    runs-on: ${{ (startsWith(inputs.linux-runner, '{') || startsWith(inputs.linux-runner, '[')) && fromJSON(inputs.linux-runner) || inputs.linux-runner }}
+    env:
+      RELEASE_NOTES: ${{ needs.resolve.outputs.release_notes }}
+      DISTRIBUTION_GROUPS: ${{ needs.resolve.outputs.groups }}
+      ANDROID_ARTIFACT_NAME: ${{ needs.build_android_artifact.outputs.android_artifact_name }}
+    steps:
+      - name: Download android artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ANDROID_ARTIFACT_NAME }}
+          path: ./artifacts/
+
+      - name: Distribute android artifact to Firebase
+        uses: crianpiro/distribute_to_firebase@v1
+        with:
+          artifact: "./artifacts/${{ env.ANDROID_ARTIFACT_NAME }}"
+          app-id: ${{ secrets.FIREBASE_ANDROID_APP_ID }}
+          groups: ${{ env.DISTRIBUTION_GROUPS }}
+          credentials: ${{ secrets.FIREBASE_DISTRIBUTION_SERVICE_ACCOUNT }}
+          release-notes: ${{ env.RELEASE_NOTES }}
+
+  distribute_artifact_to_app_store:
+    name: Distribute iOS to App Store Connect
+    needs: [resolve, build_ios_artifact]
+    if: ${{ needs.resolve.outputs.distribute_ios == 'true' }}
+    runs-on: ${{ (startsWith(inputs.macos-runner, '{') || startsWith(inputs.macos-runner, '[')) && fromJSON(inputs.macos-runner) || inputs.macos-runner }}
+    env:
+      IOS_ARTIFACT_NAME: ${{ needs.build_ios_artifact.outputs.ios_artifact_name }}
+    steps:
+      - name: Download iOS artifact
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.IOS_ARTIFACT_NAME }}
+          path: ./artifacts
+
+      # What the action adds beyond a bare altool call:
+      #
+      #   * altool can print "ERROR: ..." and still exit 0. The action checks
+      #     the output as well as the status.
+      #   * the API key is written under RUNNER_TEMP rather than into the
+      #     workspace, so it does not survive the job on a self-hosted runner.
+      #   * it waits for App Store Connect to finish processing, then posts the
+      #     release notes as the build's "What's New".
+      #   * it answers the encryption-compliance question, so a build does not
+      #     wait in TestFlight for someone to answer it by hand.
+      #
+      # It needs no checkout: the bundle id and build number come from the IPA
+      # itself, which is the artifact being uploaded and so cannot disagree
+      # with it. Reading them from a workspace would be wrong here anyway --
+      # the version bump is not committed until the release job runs, after
+      # this one.
+      - name: Upload to App Store Connect
+        uses: crianpiro/upload_build_to_testflight@v1
+        with:
+          ipa-path: artifacts/${{ env.IOS_ARTIFACT_NAME }}
+          app-store-connect-api-key-id: ${{ secrets.APPLE_API_KEY_ID }}
+          app-store-connect-api-issuer-id: ${{ secrets.APPLE_API_KEY_ISSUER_ID }}
+          app-store-connect-api-key-base64: ${{ secrets.APPLE_API_KEY_BASE64 }}
+          release-notes: ${{ needs.resolve.outputs.release_notes }}
+          uses-non-exempt-encryption: ${{ inputs.uses-non-exempt-encryption }}
+
+  release:
+    name: Tag and publish the release
+    needs:
+      [
+        resolve,
+        build_ios_artifact,
+        build_android_artifact,
+        build_macos_artifact,
+        build_windows_artifact,
+        distribute_artifact_to_firebase,
+        distribute_artifact_to_app_store,
+      ]
+    # Runs whether or not distribution was asked for, but never after a failed
+    # distribution: a release should not claim testers got something they did not.
+    #
+    # A desktop-only run has no release to publish, so it stops here. The
+    # desktop jobs it did run leave their artifacts on the workflow run.
+    #
+    # A job that was not asked for -- a platform the app opted out of, or a
+    # desktop build nobody named -- reports "skipped", not "failure", so it
+    # does not hold the release back. One that ran and failed does,
+    # deliberately: a release promising a build should not appear without it.
+    if: >-
+      ${{ !cancelled()
+      && !contains(needs.*.result, 'failure')
+      && needs.resolve.outputs.release_requested == 'true' }}
+    runs-on: ${{ (startsWith(inputs.linux-runner, '{') || startsWith(inputs.linux-runner, '[')) && fromJSON(inputs.linux-runner) || inputs.linux-runner }}
+    permissions:
+      contents: write
+    env:
+      VERSION: ${{ needs.resolve.outputs.version }}
+      BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
+      RELEASE_NOTES: ${{ needs.resolve.outputs.release_notes }}
+      ANDROID_ARTIFACT_NAME: ${{ needs.build_android_artifact.outputs.android_artifact_name }}
+      IOS_ARTIFACT_NAME: ${{ needs.build_ios_artifact.outputs.ios_artifact_name }}
+      MACOS_ARTIFACT_NAME: ${{ needs.build_macos_artifact.outputs.macos_artifact_name }}
+      WINDOWS_ARTIFACT_NAME: ${{ needs.build_windows_artifact.outputs.windows_artifact_name }}
+    steps:
+      - uses: actions/checkout@v4
+        with:
+          # This job pushes a commit and a tag, so it needs real history.
+          #
+          # No `token:` here, so checkout persists the automatic GITHUB_TOKEN,
+          # which the `permissions:` block above grants contents: write (as far
+          # as the caller allows). It is scoped to the app repository, expires
+          # with the job, and has nothing to rotate or leak.
+          #
+          # A push authenticated with GITHUB_TOKEN does not trigger workflows,
+          # so the [skip ci] below is belt and braces rather than the only
+          # thing preventing a loop.
+          fetch-depth: 0
+
+      # Each download is conditional because download-artifact fails on a name
+      # that does not exist, and every platform can be absent from a release.
+      - name: Download iOS artifact
+        if: ${{ needs.resolve.outputs.build_ios == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.IOS_ARTIFACT_NAME }}
+          path: ./artifacts
+
+      - name: Download Android artifact
+        if: ${{ needs.resolve.outputs.build_android == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.ANDROID_ARTIFACT_NAME }}
+          path: ./artifacts
+
+      - name: Download macOS artifact
+        if: ${{ needs.resolve.outputs.build_macos == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.MACOS_ARTIFACT_NAME }}
+          path: ./artifacts
+
+      - name: Download Windows artifact
+        if: ${{ needs.resolve.outputs.build_windows == 'true' }}
+        uses: actions/download-artifact@v4
+        with:
+          name: ${{ env.WINDOWS_ARTIFACT_NAME }}
+          path: ./artifacts
+
+      # pubspec.yaml is the source of truth for the version, so the bump has to
+      # land on the branch -- otherwise the next run would derive the same
+      # version again. It is committed only now, after every artifact built: a
+      # failed build leaves no version bump behind to explain.
+      #
+      # [skip ci] is belt and braces. The keyword gate already means this commit
+      # cannot retrigger the workflow, since its message carries no "build-version".
+      - name: Commit the version bump and tag the release
+        run: |
+          set -euo pipefail
+          git config user.name 'github-actions[bot]'
+          git config user.email '41898282+github-actions[bot]@users.noreply.github.com'
+
+          tmp=$(mktemp)
+          sed -E "s/^version:.*/version: ${VERSION}+${BUILD_NUMBER}/" pubspec.yaml > "$tmp"
+          mv "$tmp" pubspec.yaml
+          grep '^version:' pubspec.yaml
+
+          git add pubspec.yaml
+          git commit -m "Release v$VERSION+$BUILD_NUMBER [skip ci]"
+          git push origin "HEAD:${GITHUB_REF_NAME}"
+
+          # The tag points at the bump commit, so checking out v$VERSION gives a
+          # pubspec.yaml that reads $VERSION rather than the previous one.
+          git tag -a "v$VERSION" -m "Released v$VERSION+$BUILD_NUMBER"
+          git push origin "v$VERSION"
+
+          echo "RELEASE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
+
+      - name: Create GitHub release
+        env:
+          GH_TOKEN: ${{ github.token }}
+        run: |
+          set -euo pipefail
+          # Only the platforms this run built. Collected into an array so the
+          # absent ones leave no empty argument that gh reads as a filename.
+          assets=()
+          for name in "${IOS_ARTIFACT_NAME:-}" "${ANDROID_ARTIFACT_NAME:-}" \
+                      "${MACOS_ARTIFACT_NAME:-}" "${WINDOWS_ARTIFACT_NAME:-}"; do
+            if [[ -n "$name" ]]; then
+              assets+=("artifacts/$name")
+            fi
+          done
+
+          gh release create "v$VERSION" \
+            "${assets[@]}" \
+            --title "v$VERSION" \
+            --notes "$RELEASE_NOTES" \
+            --target "$RELEASE_SHA"
+
+          url="${{ github.server_url }}/${{ github.repository }}/releases/tag/v$VERSION"
+          echo "Released **v$VERSION+$BUILD_NUMBER** — [release]($url)" >> "$GITHUB_STEP_SUMMARY"
