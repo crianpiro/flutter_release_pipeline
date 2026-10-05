@@ -87,8 +87,8 @@ reach the GitHub release, Firebase testers and the TestFlight build's
 truth. A version named after `build-version` is written there; with none, the
 patch is bumped. The build number increments either way, because App Store
 Connect permanently refuses a build number it has seen. The bump is committed
-back to the branch and tagged `vX.Y.Z` only after every artifact has built, so
-a failed build leaves nothing behind.
+back to the branch and tagged `<tag-prefix>X.Y.Z` (`vX.Y.Z` by default) only
+after every artifact has built, so a failed build leaves nothing behind.
 
 A run fails early, before building anything, when:
 
@@ -119,6 +119,8 @@ always opt-in.
 
 | Input | Default | |
 |---|---|---|
+| `working-directory` | `.` | Directory of the app's `pubspec.yaml`, relative to the repository root. See [Several apps in one repository](#several-apps-in-one-repository). |
+| `tag-prefix` | `v` | Prepended to the version to name the tag and the release: `v1.4.0`. May be empty. |
 | `ios` | `true` | Build the IPA on a release. `false` for an app with no iOS target. |
 | `android` | `true` | Build the APK on a release. `false` for an app with no Android target. |
 | `linux-runner` | `ubuntu-latest` | `runs-on` for the Linux jobs (resolve, Android, Firebase, release). |
@@ -140,8 +142,47 @@ with:
   macos-runner: '["self-hosted", "macOS", "ARM64"]'
 ```
 
-The workflow also exposes `version`, `build_number` and `release_requested` as
-outputs, for a caller that chains further jobs after it.
+The workflow also exposes `version`, `build_number`, `tag` and
+`release_requested` as outputs, for a caller that chains further jobs after it.
+
+### Several apps in one repository
+
+Point each app's caller at its directory and give it its own tag prefix, so
+the apps' versions never claim each other's tags:
+
+```yaml
+# .github/workflows/release-mobile.yaml
+on:
+  push:
+    branches: [main]
+    paths: ["apps/mobile/**"]
+
+concurrency:
+  group: build-version
+  cancel-in-progress: false
+
+jobs:
+  pipeline:
+    uses: crianpiro/flutter_release_pipeline/.github/workflows/release.yaml@v1
+    permissions:
+      contents: write
+    with:
+      working-directory: apps/mobile
+      tag-prefix: mobile-v
+      artifact-name: mobile
+    secrets: ...
+```
+
+- **`paths:`** decides which apps a keyword commit releases: only those whose
+  directory it touches. Without it, one `build-version` commit releases every
+  app in the repository.
+- **One concurrency group for all of them.** The callers then run one after
+  another rather than racing to push their version bumps.
+- **The second app's bump goes on top of the first.** When the branch has
+  moved since the build started, the release job checks what moved it. Other
+  apps' `Release … [skip ci]` bumps are fine, and its own bump is replayed on
+  top of them. Any other commit is code this run did not build, so the release
+  fails rather than tag past it.
 
 ## Secrets
 
@@ -332,8 +373,8 @@ Distribution opened once in the console for it.
   }
   ```
 
-- **The entry point at `lib/main.dart`.** Every platform builds the default
-  target.
+- **The entry point at `lib/main.dart`** inside `working-directory`. Every
+  platform builds the default target.
 
 Desktop artifacts are not signed: the macOS `.app` is ad-hoc signed and
 Gatekeeper refuses it until it is signed with a Developer ID and notarised;

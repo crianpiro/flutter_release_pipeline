@@ -28,6 +28,19 @@ on:
         description: Build the APK on a release. False for an app with no Android target.
         type: boolean
         default: true
+      working-directory:
+        description: >-
+          The directory holding the app's pubspec.yaml, relative to the
+          repository root. For an app that is not at the root of its
+          repository, such as one app of a monorepo.
+        type: string
+        default: "."
+      tag-prefix:
+        description: >-
+          Prepended to the version to name the release tag ("v" gives v1.4.0).
+          Apps sharing a repository each need their own, such as "mobile-v".
+        type: string
+        default: v
       linux-runner:
         description: >-
           runs-on for the Linux jobs. A label ("ubuntu-latest") or a JSON
@@ -108,6 +121,9 @@ on:
       build_number:
         description: The build number this run built.
         value: ${{ jobs.resolve.outputs.build_number }}
+      tag:
+        description: The release tag, tag-prefix followed by the version.
+        value: ${{ jobs.resolve.outputs.tag }}
       release_requested:
         description: Whether the commit asked for a release ("build-version").
         value: ${{ jobs.resolve.outputs.release_requested }}
@@ -156,8 +172,17 @@ jobs:
     runs-on: ${{ (startsWith(inputs.linux-runner, '{') || startsWith(inputs.linux-runner, '[')) && fromJSON(inputs.linux-runner) || inputs.linux-runner }}
     permissions:
       contents: read
+    # Every job that checks the repository out runs its scripts from the app's
+    # directory, so pubspec.yaml and build/ are where the app keeps them.
+    # Actions take paths relative to the workspace instead, so those name the
+    # directory explicitly. The distribution jobs check nothing out and so
+    # set no default: the directory would not exist there.
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
     outputs:
       version: ${{ steps.version.outputs.version }}
+      tag: ${{ steps.version.outputs.tag }}
       build_number: ${{ steps.version.outputs.build_number }}
       artifact_name: ${{ steps.version.outputs.artifact_name }}
       release_notes: ${{ steps.version.outputs.release_notes }}
@@ -186,6 +211,7 @@ jobs:
           IOS_ENABLED: ${{ inputs.ios }}
           ANDROID_ENABLED: ${{ inputs.android }}
           ARTIFACT_NAME: ${{ inputs.artifact-name }}
+          TAG_PREFIX: ${{ inputs.tag-prefix }}
           DEFAULT_GROUPS: ${{ inputs.default-firebase-groups }}
         run: |
           set -euo pipefail
@@ -218,6 +244,14 @@ jobs:
             exit 1
           fi
 
+          # The prefix becomes part of a git ref and a release name, so it is
+          # held to characters that are safe in both. It may be empty, for
+          # tags that are the bare version.
+          if [[ ! "$TAG_PREFIX" =~ ^[A-Za-z0-9._/-]*$ ]]; then
+            echo "::error::tag-prefix may contain only letters, digits, '.', '_', '/' and '-'; read '$TAG_PREFIX'."
+            exit 1
+          fi
+
           # "build-version" is what asks for a release: the version bump, the
           # mobile artifacts, the tag and the GitHub release. Without it this
           # run only builds desktop, and must leave the version alone -- see
@@ -243,8 +277,8 @@ jobs:
               exit 1
             fi
 
-            if existing=$(git rev-list -n1 "v$version" 2>/dev/null); then
-              echo "::error::v$version already tags ${existing:0:7}. Name a different version in the commit message."
+            if existing=$(git rev-list -n1 "refs/tags/$TAG_PREFIX$version" 2>/dev/null); then
+              echo "::error::$TAG_PREFIX$version already tags ${existing:0:7}. Name a different version in the commit message."
               exit 1
             fi
           else
@@ -352,8 +386,11 @@ jobs:
             exit 1
           fi
 
+          tag=$TAG_PREFIX$version
+
           {
             echo "version=$version"
+            echo "tag=$tag"
             echo "build_number=$build_number"
             echo "artifact_name=$artifact_name"
             echo "groups=$groups"
@@ -397,9 +434,9 @@ jobs:
             # Nothing is bumped, tagged or released, so the summary says which
             # version the artifacts carry -- it is the one already released,
             # and that is easy to misread as a new one.
-            echo "Building desktop **v$version+$build_number** ($desktop) from \`${GITHUB_SHA:0:7}\` — artifacts attach to this run; nothing is bumped, tagged or released" >> "$GITHUB_STEP_SUMMARY"
+            echo "Building desktop **$tag+$build_number** ($desktop) from \`${GITHUB_SHA:0:7}\` — artifacts attach to this run; nothing is bumped, tagged or released" >> "$GITHUB_STEP_SUMMARY"
           else
-            line="Building **v$version+$build_number** ($(join "$mobile" "$desktop")) from \`${GITHUB_SHA:0:7}\`"
+            line="Building **$tag+$build_number** ($(join "$mobile" "$desktop")) from \`${GITHUB_SHA:0:7}\`"
             if [[ -n "$targets" ]]; then
               echo "$line, distributing to $targets" >> "$GITHUB_STEP_SUMMARY"
             elif [[ -n "$mobile" ]]; then
@@ -414,6 +451,9 @@ jobs:
     needs: resolve
     if: ${{ needs.resolve.outputs.build_ios == 'true' }}
     runs-on: ${{ (startsWith(inputs.macos-runner, '{') || startsWith(inputs.macos-runner, '[')) && fromJSON(inputs.macos-runner) || inputs.macos-runner }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
     outputs:
       ios_artifact_name: ${{ steps.prepare_ios_artifact.outputs.ios_artifact_name }}
     env:
@@ -453,7 +493,7 @@ jobs:
       - name: Build iOS artifact
         uses: crianpiro/build_flutter_app@v2
         with:
-          working-directory: ./
+          working-directory: ${{ inputs.working-directory }}
           certificate-base64: ${{ secrets.P12_BASE64 }}
           certificate-password: ${{ secrets.P12_PASSWORD }}
           provisioning-profile-base64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
@@ -465,9 +505,10 @@ jobs:
         run: |
           set -euo pipefail
           IPA_NAME=${ARTIFACT_NAME}-${VERSION}+${BUILD_NUMBER}.ipa
-          IPA_PATH=build/ios/ipa/$IPA_NAME
-          mv build/ios/ipa/app-release.ipa "$IPA_PATH"
-          echo "IOS_ARTIFACT_PATH=$IPA_PATH" >> "$GITHUB_ENV"
+          # To the workspace root, which upload-artifact resolves paths
+          # against, whatever the app's directory. Every artifact job does
+          # the same, so each uploads by its file name alone.
+          mv build/ios/ipa/app-release.ipa "$GITHUB_WORKSPACE/$IPA_NAME"
           echo "IOS_ARTIFACT_NAME=$IPA_NAME" >> "$GITHUB_ENV"
           echo "ios_artifact_name=$IPA_NAME" >> "$GITHUB_OUTPUT"
 
@@ -475,13 +516,16 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.IOS_ARTIFACT_NAME }}
-          path: ${{ env.IOS_ARTIFACT_PATH }}
+          path: ${{ env.IOS_ARTIFACT_NAME }}
 
   build_android_artifact:
     name: Build Android artifact
     needs: resolve
     if: ${{ needs.resolve.outputs.build_android == 'true' }}
     runs-on: ${{ (startsWith(inputs.linux-runner, '{') || startsWith(inputs.linux-runner, '[')) && fromJSON(inputs.linux-runner) || inputs.linux-runner }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
     outputs:
       android_artifact_name: ${{ steps.prepare_android_artifact.outputs.android_artifact_name }}
     env:
@@ -537,7 +581,7 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version-file: pubspec.yaml
+          flutter-version-file: ${{ inputs.working-directory }}/pubspec.yaml
 
       # With the lockfile enforced, a git dependency resolves to the commit
       # pubspec.lock pins rather than to wherever its branch points today, and
@@ -593,9 +637,7 @@ jobs:
         run: |
           set -euo pipefail
           APK_NAME=${ARTIFACT_NAME}-${VERSION}+${BUILD_NUMBER}.apk
-          APK_PATH=build/app/outputs/flutter-apk/$APK_NAME
-          mv build/app/outputs/flutter-apk/app-release.apk "$APK_PATH"
-          echo "ANDROID_ARTIFACT_PATH=$APK_PATH" >> "$GITHUB_ENV"
+          mv build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/$APK_NAME"
           echo "ANDROID_ARTIFACT_NAME=$APK_NAME" >> "$GITHUB_ENV"
           echo "android_artifact_name=$APK_NAME" >> "$GITHUB_OUTPUT"
 
@@ -603,13 +645,16 @@ jobs:
         uses: actions/upload-artifact@v4
         with:
           name: ${{ env.ANDROID_ARTIFACT_NAME }}
-          path: ${{ env.ANDROID_ARTIFACT_PATH }}
+          path: ${{ env.ANDROID_ARTIFACT_NAME }}
 
   build_macos_artifact:
     name: Build macOS artifact
     needs: resolve
     if: ${{ needs.resolve.outputs.build_macos == 'true' }}
     runs-on: ${{ (startsWith(inputs.macos-runner, '{') || startsWith(inputs.macos-runner, '[')) && fromJSON(inputs.macos-runner) || inputs.macos-runner }}
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
     outputs:
       macos_artifact_name: ${{ steps.prepare_macos_artifact.outputs.macos_artifact_name }}
     env:
@@ -638,7 +683,7 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version-file: pubspec.yaml
+          flutter-version-file: ${{ inputs.working-directory }}/pubspec.yaml
 
       - name: Install Dependencies
         run: flutter pub get ${{ inputs.enforce-lockfile && '--enforce-lockfile' || '' }}
@@ -675,7 +720,7 @@ jobs:
             exit 1
           fi
           MACOS_NAME=${ARTIFACT_NAME}-macos-${VERSION}+${BUILD_NUMBER}.zip
-          ditto -c -k --sequesterRsrc --keepParent "${apps[0]}" "$MACOS_NAME"
+          ditto -c -k --sequesterRsrc --keepParent "${apps[0]}" "$GITHUB_WORKSPACE/$MACOS_NAME"
           echo "MACOS_ARTIFACT_NAME=$MACOS_NAME" >> "$GITHUB_ENV"
           echo "macos_artifact_name=$MACOS_NAME" >> "$GITHUB_OUTPUT"
 
@@ -695,6 +740,7 @@ jobs:
         # The scripts below are POSIX shell, not PowerShell, matching the rest
         # of this file. Git for Windows provides bash on the hosted image.
         shell: bash
+        working-directory: ${{ inputs.working-directory }}
     outputs:
       windows_artifact_name: ${{ steps.prepare_windows_artifact.outputs.windows_artifact_name }}
     env:
@@ -721,7 +767,7 @@ jobs:
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
         with:
-          flutter-version-file: pubspec.yaml
+          flutter-version-file: ${{ inputs.working-directory }}/pubspec.yaml
 
       - name: Install Dependencies
         run: flutter pub get ${{ inputs.enforce-lockfile && '--enforce-lockfile' || '' }}
@@ -860,7 +906,11 @@ jobs:
     runs-on: ${{ (startsWith(inputs.linux-runner, '{') || startsWith(inputs.linux-runner, '[')) && fromJSON(inputs.linux-runner) || inputs.linux-runner }}
     permissions:
       contents: write
+    defaults:
+      run:
+        working-directory: ${{ inputs.working-directory }}
     env:
+      TAG: ${{ needs.resolve.outputs.tag }}
       VERSION: ${{ needs.resolve.outputs.version }}
       BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
       RELEASE_NOTES: ${{ needs.resolve.outputs.release_notes }}
@@ -932,13 +982,30 @@ jobs:
           grep '^version:' pubspec.yaml
 
           git add pubspec.yaml
-          git commit -m "Release v$VERSION+$BUILD_NUMBER [skip ci]"
+          git commit -m "Release $TAG+$BUILD_NUMBER [skip ci]"
+
+          # Apps sharing a repository release from the same commit, one after
+          # the other, so by now the branch may carry another app's bump on
+          # top of the commit this run built. Those touch only that app's
+          # pubspec.yaml, and this bump is replayed on top of them. Anything
+          # else that moved the branch is code this run did not build, and the
+          # tag must not point past it, so that stays a failure.
+          git fetch --quiet origin "$GITHUB_REF_NAME"
+          if ! git merge-base --is-ancestor FETCH_HEAD HEAD; then
+            others=$(git log --format=%s "HEAD..FETCH_HEAD" | grep -vE '^Release [^ ]+\+[0-9]+ \[skip ci\]$' || true)
+            if [[ -n "$others" ]]; then
+              echo "::error::$GITHUB_REF_NAME moved past the built commit with changes this run did not build:"
+              printf '%s\n' "$others"
+              exit 1
+            fi
+            git rebase FETCH_HEAD
+          fi
           git push origin "HEAD:${GITHUB_REF_NAME}"
 
-          # The tag points at the bump commit, so checking out v$VERSION gives a
+          # The tag points at the bump commit, so checking out the tag gives a
           # pubspec.yaml that reads $VERSION rather than the previous one.
-          git tag -a "v$VERSION" -m "Released v$VERSION+$BUILD_NUMBER"
-          git push origin "v$VERSION"
+          git tag -a "$TAG" -m "Released $TAG+$BUILD_NUMBER"
+          git push origin "refs/tags/$TAG"
 
           echo "RELEASE_SHA=$(git rev-parse HEAD)" >> "$GITHUB_ENV"
 
@@ -949,19 +1016,20 @@ jobs:
           set -euo pipefail
           # Only the platforms this run built. Collected into an array so the
           # absent ones leave no empty argument that gh reads as a filename.
+          # The downloads land in the workspace, not the app's directory.
           assets=()
           for name in "${IOS_ARTIFACT_NAME:-}" "${ANDROID_ARTIFACT_NAME:-}" \
                       "${MACOS_ARTIFACT_NAME:-}" "${WINDOWS_ARTIFACT_NAME:-}"; do
             if [[ -n "$name" ]]; then
-              assets+=("artifacts/$name")
+              assets+=("$GITHUB_WORKSPACE/artifacts/$name")
             fi
           done
 
-          gh release create "v$VERSION" \
+          gh release create "$TAG" \
             "${assets[@]}" \
-            --title "v$VERSION" \
+            --title "$TAG" \
             --notes "$RELEASE_NOTES" \
             --target "$RELEASE_SHA"
 
-          url="${{ github.server_url }}/${{ github.repository }}/releases/tag/v$VERSION"
-          echo "Released **v$VERSION+$BUILD_NUMBER** — [release]($url)" >> "$GITHUB_STEP_SUMMARY"
+          url="${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"
+          echo "Released **$TAG+$BUILD_NUMBER** — [release]($url)" >> "$GITHUB_STEP_SUMMARY"
