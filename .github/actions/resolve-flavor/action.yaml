@@ -1,0 +1,88 @@
+# Picks the flavor a release commit names, for an app that has flavors.
+#
+# This runs in the caller's workflow, before the pipeline, and not inside it,
+# because of secrets. Each flavor has its own signing and distribution secrets
+# (P12_BASE64_PROD, FIREBASE_ANDROID_APP_ID_DEV, ...), and a reusable workflow
+# can only receive secrets under names it declares in advance. So the caller
+# has to choose which flavor's secrets to pass, and for that it needs the
+# flavor before the pipeline starts. This action is how it gets it.
+#
+# A release commit names its flavor with "flavor: <name>", usually on a line
+# of its own like "groups:":
+#
+#   build-version distribute-ios
+#   flavor: prod
+
+name: Resolve flavor
+description: Read the flavor named in the release commit and check it is one the app has.
+
+inputs:
+  flavors:
+    description: >-
+      The app's flavors, comma-separated ("dev, prod"). Empty for an app
+      without flavors, which then refuses a commit that names one.
+    required: false
+    default: ""
+
+outputs:
+  flavor:
+    description: The flavor to release, as named in the commit. Empty for an app without flavors.
+    value: ${{ steps.flavor.outputs.flavor }}
+  suffix:
+    description: >-
+      The flavor upper-cased, for building secret names: "prod" gives "PROD",
+      to read P12_BASE64_PROD. Empty for an app without flavors.
+    value: ${{ steps.flavor.outputs.suffix }}
+
+runs:
+  using: composite
+  steps:
+    - id: flavor
+      shell: bash
+      env:
+        COMMIT_MESSAGE: ${{ github.event.head_commit.message }}
+        FLAVORS: ${{ inputs.flavors }}
+      run: |
+        set -euo pipefail
+
+        # "flavor: prod", "flavor:prod" or "Flavor: prod" anywhere in the
+        # message; the name is the word that follows.
+        named=$(
+          printf '%s' "$COMMIT_MESSAGE" \
+            | grep -oiE '(^|[^-[:alnum:]])flavor:[[:space:]]*[A-Za-z0-9_]+' \
+            | head -1 \
+            | sed -E 's/.*:[[:space:]]*//' \
+            || true
+        )
+
+        # Whitespace around the commas is dropped, as for "groups:".
+        list=$(printf '%s' "$FLAVORS" |
+               sed -E 's/^[[:space:]]+//; s/[[:space:]]+$//; s/[[:space:]]*,[[:space:]]*/,/g')
+
+        if [[ -z "$list" ]]; then
+          if [[ -n "$named" ]]; then
+            echo "::error::The commit names flavor '$named', but this app is configured without flavors."
+            exit 1
+          fi
+        else
+          # Every release of a flavored app is a release of one flavor, so
+          # there is no default to fall back on: building the wrong flavor
+          # under the right version would consume the version for nothing.
+          if [[ -z "$named" ]]; then
+            echo "::error::Name the flavor to release in the commit message, as \"flavor: <name>\". This app's flavors: ${list//,/, }."
+            exit 1
+          fi
+          if [[ ",$list," != *",$named,"* ]]; then
+            echo "::error::'$named' is not one of this app's flavors: ${list//,/, }."
+            exit 1
+          fi
+        fi
+
+        suffix=$(printf '%s' "$named" | tr '[:lower:]' '[:upper:]')
+        {
+          echo "flavor=$named"
+          echo "suffix=$suffix"
+        } >> "$GITHUB_OUTPUT"
+        if [[ -n "$named" ]]; then
+          echo "[INFO] Releasing flavor '$named'; secrets are read with the suffix _$suffix"
+        fi

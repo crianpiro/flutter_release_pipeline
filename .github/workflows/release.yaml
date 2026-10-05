@@ -39,8 +39,23 @@ on:
         description: >-
           Prepended to the version to name the release tag ("v" gives v1.4.0).
           Apps sharing a repository each need their own, such as "mobile-v".
+          A flavored release puts "<flavor>-" in front of it, unless the
+          prefix places the flavor itself with "{flavor}".
         type: string
         default: v
+      flavor:
+        description: >-
+          The flavor this run builds and releases, usually the output of the
+          resolve-flavor action. Empty for an app without flavors.
+        type: string
+        default: ""
+      target:
+        description: >-
+          The Dart entry point, relative to working-directory. "{flavor}" is
+          replaced by the flavor. Defaults to lib/main.dart, or to
+          lib/main_{flavor}.dart when a flavor is set.
+        type: string
+        default: ""
       linux-runner:
         description: >-
           runs-on for the Linux jobs. A label ("ubuntu-latest") or a JSON
@@ -124,6 +139,9 @@ on:
       tag:
         description: The release tag, tag-prefix followed by the version.
         value: ${{ jobs.resolve.outputs.tag }}
+      flavor:
+        description: The flavor this run built, empty for an app without flavors.
+        value: ${{ jobs.resolve.outputs.flavor }}
       release_requested:
         description: Whether the commit asked for a release ("build-version").
         value: ${{ jobs.resolve.outputs.release_requested }}
@@ -183,6 +201,8 @@ jobs:
     outputs:
       version: ${{ steps.version.outputs.version }}
       tag: ${{ steps.version.outputs.tag }}
+      flavor: ${{ steps.version.outputs.flavor }}
+      target: ${{ steps.version.outputs.target }}
       build_number: ${{ steps.version.outputs.build_number }}
       artifact_name: ${{ steps.version.outputs.artifact_name }}
       release_notes: ${{ steps.version.outputs.release_notes }}
@@ -212,6 +232,8 @@ jobs:
           ANDROID_ENABLED: ${{ inputs.android }}
           ARTIFACT_NAME: ${{ inputs.artifact-name }}
           TAG_PREFIX: ${{ inputs.tag-prefix }}
+          FLAVOR: ${{ inputs.flavor }}
+          TARGET: ${{ inputs.target }}
           DEFAULT_GROUPS: ${{ inputs.default-firebase-groups }}
         run: |
           set -euo pipefail
@@ -245,10 +267,37 @@ jobs:
           fi
 
           # The prefix becomes part of a git ref and a release name, so it is
-          # held to characters that are safe in both. It may be empty, for
-          # tags that are the bare version.
-          if [[ ! "$TAG_PREFIX" =~ ^[A-Za-z0-9._/-]*$ ]]; then
+          # held to characters that are safe in both, besides the "{flavor}"
+          # placeholder. It may be empty, for tags that are the bare version.
+          if [[ ! "${TAG_PREFIX//\{flavor\}/}" =~ ^[A-Za-z0-9._/-]*$ ]]; then
             echo "::error::tag-prefix may contain only letters, digits, '.', '_', '/' and '-'; read '$TAG_PREFIX'."
+            exit 1
+          fi
+
+          # The flavor reaches file names, a git ref and Gradle, which takes
+          # it as part of a task name, so it is held to an identifier.
+          if [[ -n "$FLAVOR" && ! "$FLAVOR" =~ ^[A-Za-z][A-Za-z0-9_]*$ ]]; then
+            echo "::error::flavor must start with a letter and contain only letters, digits and '_'; read '$FLAVOR'."
+            exit 1
+          fi
+
+          # Each flavor is released on its own, so its tag has to say which
+          # one it is: "{flavor}" in the prefix places it, and without that it
+          # leads. The version line is shared -- every release bumps the one
+          # pubspec.yaml -- so the version alone stays unique either way.
+          if [[ -n "$FLAVOR" && "$TAG_PREFIX" != *"{flavor}"* ]]; then
+            TAG_PREFIX="$FLAVOR-$TAG_PREFIX"
+          fi
+          TAG_PREFIX=${TAG_PREFIX//\{flavor\}/$FLAVOR}
+
+          # The entry point is checked here, before any runner is spent on a
+          # build that would fail on it.
+          if [[ -z "$TARGET" ]]; then
+            if [[ -n "$FLAVOR" ]]; then TARGET='lib/main_{flavor}.dart'; else TARGET='lib/main.dart'; fi
+          fi
+          TARGET=${TARGET//\{flavor\}/$FLAVOR}
+          if [[ ! -f "$TARGET" ]]; then
+            echo "::error::The entry point $TARGET does not exist in $(pwd). Set the target input to the app's main file."
             exit 1
           fi
 
@@ -380,7 +429,7 @@ jobs:
 
           # Every artifact file name starts with this, so it must not carry
           # anything a path or a release asset name would trip over.
-          artifact_name=${ARTIFACT_NAME:-${GITHUB_REPOSITORY#*/}}
+          artifact_name=${ARTIFACT_NAME:-${GITHUB_REPOSITORY#*/}}${FLAVOR:+-$FLAVOR}
           if [[ ! "$artifact_name" =~ ^[A-Za-z0-9._-]+$ ]]; then
             echo "::error::artifact-name may contain only letters, digits, '.', '_' and '-'; read '$artifact_name'."
             exit 1
@@ -391,6 +440,8 @@ jobs:
           {
             echo "version=$version"
             echo "tag=$tag"
+            echo "flavor=$FLAVOR"
+            echo "target=$TARGET"
             echo "build_number=$build_number"
             echo "artifact_name=$artifact_name"
             echo "groups=$groups"
@@ -460,6 +511,8 @@ jobs:
       VERSION: ${{ needs.resolve.outputs.version }}
       BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
       ARTIFACT_NAME: ${{ needs.resolve.outputs.artifact_name }}
+      FLAVOR: ${{ needs.resolve.outputs.flavor }}
+      TARGET: ${{ needs.resolve.outputs.target }}
       # Read by the credential helper defined at the top of this file, when
       # `flutter pub get` fetches private Git dependencies.
       GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
@@ -494,6 +547,8 @@ jobs:
         uses: crianpiro/build_flutter_app@v2
         with:
           working-directory: ${{ inputs.working-directory }}
+          flavor: ${{ env.FLAVOR }}
+          target: ${{ env.TARGET }}
           certificate-base64: ${{ secrets.P12_BASE64 }}
           certificate-password: ${{ secrets.P12_PASSWORD }}
           provisioning-profile-base64: ${{ secrets.PROVISIONING_PROFILE_BASE64 }}
@@ -508,7 +563,8 @@ jobs:
           # To the workspace root, which upload-artifact resolves paths
           # against, whatever the app's directory. Every artifact job does
           # the same, so each uploads by its file name alone.
-          mv build/ios/ipa/app-release.ipa "$GITHUB_WORKSPACE/$IPA_NAME"
+          # build_flutter_app names a flavored IPA app-<flavor>-release.ipa.
+          mv "build/ios/ipa/app-${FLAVOR:+$FLAVOR-}release.ipa" "$GITHUB_WORKSPACE/$IPA_NAME"
           echo "IOS_ARTIFACT_NAME=$IPA_NAME" >> "$GITHUB_ENV"
           echo "ios_artifact_name=$IPA_NAME" >> "$GITHUB_OUTPUT"
 
@@ -532,6 +588,8 @@ jobs:
       VERSION: ${{ needs.resolve.outputs.version }}
       BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
       ARTIFACT_NAME: ${{ needs.resolve.outputs.artifact_name }}
+      FLAVOR: ${{ needs.resolve.outputs.flavor }}
+      TARGET: ${{ needs.resolve.outputs.target }}
       # Read by the credential helper defined at the top of this file, when
       # `flutter pub get` fetches private Git dependencies.
       GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
@@ -630,14 +688,14 @@ jobs:
           ANDROID_KEY_ALIAS: ${{ secrets.KEY_ALIAS }}
           LANG: C.UTF-8
           LC_ALL: C.UTF-8
-        run: flutter build apk --release
+        run: flutter build apk --release ${FLAVOR:+--flavor "$FLAVOR"} --target "$TARGET"
 
       - name: Prepare Android artifact
         id: prepare_android_artifact
         run: |
           set -euo pipefail
           APK_NAME=${ARTIFACT_NAME}-${VERSION}+${BUILD_NUMBER}.apk
-          mv build/app/outputs/flutter-apk/app-release.apk "$GITHUB_WORKSPACE/$APK_NAME"
+          mv "build/app/outputs/flutter-apk/app-${FLAVOR:+$FLAVOR-}release.apk" "$GITHUB_WORKSPACE/$APK_NAME"
           echo "ANDROID_ARTIFACT_NAME=$APK_NAME" >> "$GITHUB_ENV"
           echo "android_artifact_name=$APK_NAME" >> "$GITHUB_OUTPUT"
 
@@ -661,6 +719,8 @@ jobs:
       VERSION: ${{ needs.resolve.outputs.version }}
       BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
       ARTIFACT_NAME: ${{ needs.resolve.outputs.artifact_name }}
+      FLAVOR: ${{ needs.resolve.outputs.flavor }}
+      TARGET: ${{ needs.resolve.outputs.target }}
       GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
     steps:
       - uses: actions/checkout@v4
@@ -699,7 +759,7 @@ jobs:
         run: pod repo update
 
       - name: Build macOS artifact
-        run: flutter build macos --release
+        run: flutter build macos --release ${FLAVOR:+--flavor "$FLAVOR"} --target "$TARGET"
 
       # The .app is found rather than named, because its name is the app's
       # PRODUCT_NAME and differs per app. ditto rather than zip: a .app is a
@@ -711,7 +771,9 @@ jobs:
         id: prepare_macos_artifact
         run: |
           set -euo pipefail
-          products=build/macos/Build/Products/Release
+          # A flavor builds the Xcode configuration Release-<flavor>, and its
+          # products land under that configuration's name.
+          products=build/macos/Build/Products/Release${FLAVOR:+-$FLAVOR}
           apps=()
           while IFS= read -r app; do apps+=("$app"); done < <(find "$products" -maxdepth 1 -name '*.app' -type d)
           if (( ${#apps[@]} != 1 )); then
@@ -747,6 +809,8 @@ jobs:
       VERSION: ${{ needs.resolve.outputs.version }}
       BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
       ARTIFACT_NAME: ${{ needs.resolve.outputs.artifact_name }}
+      FLAVOR: ${{ needs.resolve.outputs.flavor }}
+      TARGET: ${{ needs.resolve.outputs.target }}
       GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
     steps:
       - uses: actions/checkout@v4
@@ -776,8 +840,12 @@ jobs:
       # fetch it at CMake configure time, on every clean build -- so this may
       # need outbound access to github.com, and a locked-down runner fails
       # here rather than at `pub get`.
+      #
+      # Flutter's --flavor covers Android, iOS and macOS only, so a flavored
+      # Windows build is the flavor's entry point alone, and appFlavor reads
+      # null there.
       - name: Build Windows artifact
-        run: flutter build windows --release
+        run: flutter build windows --release --target "$TARGET"
 
       # The runner output is a directory, not a single file: the .exe needs the
       # Flutter DLLs and the data/ folder beside it or it will not start. The

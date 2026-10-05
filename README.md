@@ -69,6 +69,7 @@ build-version distribute-android                 ...and ship the APK to Firebase
 build-version distribute-ios                     ...and ship the IPA to App Store Connect
 build-version distribute-ios distribute-android  ...ship both
 groups: qa, management                           Firebase tester groups for this release
+flavor: prod                                     the flavor to release (flavored apps only)
 
 build-version build-desktop-version                  ...also attach macOS and Windows builds
 build-version build-desktop-version desktop-macos    ...macOS only
@@ -120,7 +121,9 @@ always opt-in.
 | Input | Default | |
 |---|---|---|
 | `working-directory` | `.` | Directory of the app's `pubspec.yaml`, relative to the repository root. See [Several apps in one repository](#several-apps-in-one-repository). |
-| `tag-prefix` | `v` | Prepended to the version to name the tag and the release: `v1.4.0`. May be empty. |
+| `tag-prefix` | `v` | Prepended to the version to name the tag and the release: `v1.4.0`. May be empty. A flavored release leads with the flavor (`prod-v1.4.0`) unless the prefix places it with `{flavor}`. |
+| `flavor` | empty | The flavor to build and release. See [Flavors](#flavors). |
+| `target` | `lib/main.dart`, or `lib/main_{flavor}.dart` with a flavor | Dart entry point, relative to `working-directory`. `{flavor}` is replaced by the flavor. Checked before any build starts. |
 | `ios` | `true` | Build the IPA on a release. `false` for an app with no iOS target. |
 | `android` | `true` | Build the APK on a release. `false` for an app with no Android target. |
 | `linux-runner` | `ubuntu-latest` | `runs-on` for the Linux jobs (resolve, Android, Firebase, release). |
@@ -142,7 +145,7 @@ with:
   macos-runner: '["self-hosted", "macOS", "ARM64"]'
 ```
 
-The workflow also exposes `version`, `build_number`, `tag` and
+The workflow also exposes `version`, `build_number`, `tag`, `flavor` and
 `release_requested` as outputs, for a caller that chains further jobs after it.
 
 ### Several apps in one repository
@@ -183,6 +186,151 @@ jobs:
   apps' `Release … [skip ci]` bumps are fine, and its own bump is replayed on
   top of them. Any other commit is code this run did not build, so the release
   fails rather than tag past it.
+
+## Flavors
+
+Each release of a flavored app is a release of **one** flavor, named in the
+commit message, and distribution goes only to that flavor's testers:
+
+```
+build-version distribute-ios distribute-android
+flavor: prod
+```
+
+A commit that names no flavor, or one the app does not have, fails before
+anything builds. There is deliberately no default flavor: a release built from
+the wrong one would still consume the version.
+
+### What a flavored release produces
+
+| | Without a flavor | With `flavor: prod` |
+|---|---|---|
+| Entry point | `lib/main.dart` | `lib/main_prod.dart` (override with `target`) |
+| Tag and release | `v1.4.0` | `prod-v1.4.0` |
+| Artifacts | `myapp-1.4.0+12.apk` | `myapp-prod-1.4.0+12.apk` |
+
+All flavors share one version line, because they share one `pubspec.yaml`:
+releasing `prod` at 1.4.0 and then `dev` gives `dev-v1.4.1`. Every version
+belongs to exactly one flavor's release.
+
+### Per-flavor secrets
+
+Each flavor reads its secrets with its name upper-cased as a suffix:
+`PROVISIONING_PROFILE_BASE64_PROD`, `FIREBASE_ANDROID_APP_ID_DEV`. A secret
+without the suffix is the shared fallback, for what flavors usually have in
+common: one distribution certificate, one upload keystore, one App Store
+Connect API key. Typically per flavor are `PROVISIONING_PROFILE_BASE64`,
+`EXPORT_OPTIONS` and `FIREBASE_ANDROID_APP_ID` (each flavor has its own bundle
+id), and `FIREBASE_DISTRIBUTION_SERVICE_ACCOUNT` when flavors live in separate
+Firebase projects.
+
+A reusable workflow can only receive secrets under names it declares, so the
+caller picks each flavor's secrets itself. That is why a flavored caller has
+one job more: the `resolve-flavor` action reads the flavor from the commit
+first, and the secrets are looked up with its suffix.
+
+```yaml
+name: "Build & distribute"
+
+on:
+  push:
+    branches: [main]
+
+concurrency:
+  group: build-version
+  cancel-in-progress: false
+
+jobs:
+  flavor:
+    # Only release commits need a flavor; every other push skips both jobs.
+    if: >-
+      contains(github.event.head_commit.message, 'build-version') ||
+      contains(github.event.head_commit.message, 'build-desktop-version')
+    runs-on: ubuntu-latest
+    outputs:
+      flavor: ${{ steps.flavor.outputs.flavor }}
+      suffix: ${{ steps.flavor.outputs.suffix }}
+    steps:
+      - id: flavor
+        uses: crianpiro/flutter_release_pipeline/.github/actions/resolve-flavor@v1
+        with:
+          flavors: dev, prod
+
+  pipeline:
+    needs: flavor
+    uses: crianpiro/flutter_release_pipeline/.github/workflows/release.yaml@v1
+    permissions:
+      contents: write
+    with:
+      flavor: ${{ needs.flavor.outputs.flavor }}
+      artifact-name: myapp
+    # Each line takes the flavor's own secret, and falls back to the shared one.
+    secrets:
+      P12_BASE64: ${{ secrets[format('P12_BASE64_{0}', needs.flavor.outputs.suffix)] || secrets.P12_BASE64 }}
+      P12_PASSWORD: ${{ secrets[format('P12_PASSWORD_{0}', needs.flavor.outputs.suffix)] || secrets.P12_PASSWORD }}
+      PROVISIONING_PROFILE_BASE64: ${{ secrets[format('PROVISIONING_PROFILE_BASE64_{0}', needs.flavor.outputs.suffix)] || secrets.PROVISIONING_PROFILE_BASE64 }}
+      EXPORT_OPTIONS: ${{ secrets[format('EXPORT_OPTIONS_{0}', needs.flavor.outputs.suffix)] || secrets.EXPORT_OPTIONS }}
+      RUNNER_KEYCHAIN_PASSWORD: ${{ secrets.RUNNER_KEYCHAIN_PASSWORD }}
+      KEYSTORE_BASE64: ${{ secrets[format('KEYSTORE_BASE64_{0}', needs.flavor.outputs.suffix)] || secrets.KEYSTORE_BASE64 }}
+      KEYSTORE_PASSWORD: ${{ secrets[format('KEYSTORE_PASSWORD_{0}', needs.flavor.outputs.suffix)] || secrets.KEYSTORE_PASSWORD }}
+      KEY_PASSWORD: ${{ secrets[format('KEY_PASSWORD_{0}', needs.flavor.outputs.suffix)] || secrets.KEY_PASSWORD }}
+      KEY_ALIAS: ${{ secrets[format('KEY_ALIAS_{0}', needs.flavor.outputs.suffix)] || secrets.KEY_ALIAS }}
+      FIREBASE_ANDROID_APP_ID: ${{ secrets[format('FIREBASE_ANDROID_APP_ID_{0}', needs.flavor.outputs.suffix)] || secrets.FIREBASE_ANDROID_APP_ID }}
+      FIREBASE_DISTRIBUTION_SERVICE_ACCOUNT: ${{ secrets[format('FIREBASE_DISTRIBUTION_SERVICE_ACCOUNT_{0}', needs.flavor.outputs.suffix)] || secrets.FIREBASE_DISTRIBUTION_SERVICE_ACCOUNT }}
+      APPLE_API_KEY_ID: ${{ secrets[format('APPLE_API_KEY_ID_{0}', needs.flavor.outputs.suffix)] || secrets.APPLE_API_KEY_ID }}
+      APPLE_API_KEY_ISSUER_ID: ${{ secrets[format('APPLE_API_KEY_ISSUER_ID_{0}', needs.flavor.outputs.suffix)] || secrets.APPLE_API_KEY_ISSUER_ID }}
+      APPLE_API_KEY_BASE64: ${{ secrets[format('APPLE_API_KEY_BASE64_{0}', needs.flavor.outputs.suffix)] || secrets.APPLE_API_KEY_BASE64 }}
+```
+
+The `flavor` job only reads the commit message, so it runs anywhere; point
+`runs-on` at a self-hosted runner if hosted minutes matter.
+
+Prefer the fallback for anything genuinely shared rather than duplicating it
+under every suffix: a certificate renewed in one place cannot be forgotten in
+another.
+
+### Setting the flavors up in the app
+
+The pipeline builds with `--flavor <name>`, so every platform it builds has to
+know the flavor by exactly that name.
+
+- **Android** — a `productFlavors` entry per flavor in
+  `android/app/build.gradle(.kts)`, usually with its own `applicationIdSuffix`
+  ([Set up Flutter flavors for Android](https://docs.flutter.dev/deployment/flavors)).
+  The release signing config read from the environment (see
+  [What the app has to provide](#what-the-app-has-to-provide)) applies to
+  every flavor.
+- **iOS** — in `ios/Runner.xcworkspace`, an Xcode **scheme named exactly like
+  the flavor**, with build configurations `Debug-<flavor>`,
+  `Profile-<flavor>` and `Release-<flavor>`, and the flavor's bundle id set on
+  them ([Set up Flutter flavors for iOS and macOS](https://docs.flutter.dev/deployment/flavors-ios)).
+  Each bundle id then needs its own App ID, App Store provisioning profile and
+  App Store Connect app record (see [iOS signing](#ios-signing)), and its own
+  `EXPORT_OPTIONS_<FLAVOR>` mapping that bundle id to that profile. An
+  existing `ios/Podfile` has to list the new configurations next to the
+  original ones (the guide's *Update Podfiles* step):
+
+  ```ruby
+  project 'Runner', {
+    'Debug' => :debug, 'Debug-dev' => :debug, 'Debug-prod' => :debug,
+    'Profile' => :release, 'Profile-dev' => :release, 'Profile-prod' => :release,
+    'Release' => :release, 'Release-dev' => :release, 'Release-prod' => :release,
+  }
+  ```
+
+- **macOS** — the same schemes and configurations, made again in
+  `macos/Runner.xcworkspace` (the same
+  [iOS and macOS guide](https://docs.flutter.dev/deployment/flavors-ios)), and
+  the same `project` mapping in `macos/Podfile`. The build lands in
+  `build/macos/Build/Products/Release-<flavor>/`, which the pipeline expects.
+- **Windows** — Flutter's `--flavor` covers Android, iOS and macOS only. A
+  flavored Windows build compiles the flavor's entry point and nothing more,
+  so anything the flavor changes must come from that entry point; `appFlavor`
+  reads `null` there.
+- **Firebase** — each flavor's Android application id is a separate app in
+  Firebase, so each has its own `FIREBASE_ANDROID_APP_ID_<FLAVOR>`. If the
+  flavors live in different Firebase projects, the service account and the
+  tester groups are per project too.
 
 ## Secrets
 
@@ -373,8 +521,8 @@ Distribution opened once in the console for it.
   }
   ```
 
-- **The entry point at `lib/main.dart`** inside `working-directory`. Every
-  platform builds the default target.
+- **The entry point** inside `working-directory`: `lib/main.dart`, or
+  `lib/main_<flavor>.dart` for a flavored app, unless `target` says otherwise.
 
 Desktop artifacts are not signed: the macOS `.app` is ad-hoc signed and
 Gatekeeper refuses it until it is signed with a Developer ID and notarised;
