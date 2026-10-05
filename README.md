@@ -165,6 +165,152 @@ so the token never appears in a remote URL, the process table, or the runner's
 global `.gitconfig`. The release job pushes with the automatic `GITHUB_TOKEN`,
 not this one.
 
+## Getting the secrets
+
+Everything below ends as a repository secret of the **app** repository
+(Settings → Secrets and variables → Actions; see
+[GitHub's guide](https://docs.github.com/en/actions/security-for-github-actions/security-guides/using-secrets-in-github-actions)).
+Piping a value straight into `gh secret set` is safer than copying it through
+the clipboard, which can add or drop a trailing newline:
+
+```bash
+base64 -i certificate.p12 | gh secret set P12_BASE64
+gh secret set EXPORT_OPTIONS < ios/ExportOptions.plist
+gh secret set P12_PASSWORD          # prompts for the value
+```
+
+The `base64 -i` spelling is macOS's; on Linux use `base64 -w0 <file>`.
+
+### iOS signing
+
+You need a paid Apple Developer Program membership, the app's bundle id
+registered under Identifiers, and its record created in App Store Connect
+([Add a new app](https://developer.apple.com/help/app-store-connect/create-an-app-record/add-a-new-app))
+before the first upload. GitHub's
+[Installing an Apple certificate on macOS runners](https://docs.github.com/en/actions/use-cases-and-examples/deploying/installing-an-apple-certificate-on-macos-runners-for-xcode-development)
+walks through the first three secrets end to end.
+
+- **`P12_BASE64`, `P12_PASSWORD`** — an **Apple Distribution** certificate
+  with its private key, exported as `.p12`.
+  1. [Create a certificate signing request](https://developer.apple.com/help/account/certificates/create-a-certificate-signing-request)
+     in Keychain Access.
+  2. In [Certificates](https://developer.apple.com/account/resources/certificates/list),
+     create an *Apple Distribution* certificate from it
+     ([overview](https://developer.apple.com/help/account/certificates/certificates-overview)),
+     download it and double-click it into your keychain.
+  3. In Keychain Access → My Certificates, select the certificate together
+     with its private key and
+     [export it](https://support.apple.com/guide/keychain-access/import-and-export-keychain-items-kyca35961/mac)
+     as `.p12`. The password you choose there is `P12_PASSWORD`; base64 of the
+     file is `P12_BASE64`.
+- **`PROVISIONING_PROFILE_BASE64`** — an
+  [App Store provisioning profile](https://developer.apple.com/help/account/provisioning-profiles/create-an-app-store-provisioning-profile)
+  for the bundle id, tied to that certificate. Base64 of the downloaded
+  `.mobileprovision`. It expires yearly, and must be regenerated whenever the
+  certificate changes.
+- **`EXPORT_OPTIONS`** — the plain XML contents of an `ExportOptions.plist`
+  that maps the bundle id to the profile above. The easiest way to get one is
+  to archive once in Xcode (Product → Archive → Distribute App → App Store
+  Connect → Export); the export folder contains it. Otherwise write it by hand:
+
+  ```xml
+  <?xml version="1.0" encoding="UTF-8"?>
+  <!DOCTYPE plist PUBLIC "-//Apple//DTD PLIST 1.0//EN" "http://www.apple.com/DTDs/PropertyList-1.0.dtd">
+  <plist version="1.0">
+  <dict>
+    <key>method</key>
+    <string>app-store-connect</string>
+    <key>teamID</key>
+    <string>YOUR_TEAM_ID</string>
+    <key>signingStyle</key>
+    <string>manual</string>
+    <key>provisioningProfiles</key>
+    <dict>
+      <key>com.example.app</key>
+      <string>Name of the App Store profile</string>
+    </dict>
+  </dict>
+  </plist>
+  ```
+
+  `app-store-connect` needs Xcode 15.3 or later; older Xcode spells it
+  `app-store`. The team id is under Membership details in your
+  [developer account](https://developer.apple.com/account).
+- **`RUNNER_KEYCHAIN_PASSWORD`** — not issued by anyone: any random string.
+  It locks the temporary keychain the build creates.
+
+  ```bash
+  openssl rand -base64 32 | gh secret set RUNNER_KEYCHAIN_PASSWORD
+  ```
+
+### App Store Connect (`distribute-ios`)
+
+- **`APPLE_API_KEY_ID`, `APPLE_API_KEY_ISSUER_ID`, `APPLE_API_KEY_BASE64`** —
+  a team API key
+  ([Creating API keys](https://developer.apple.com/documentation/appstoreconnectapi/creating-api-keys-for-app-store-connect-api)).
+  1. In [App Store Connect → Users and Access → Integrations → App Store Connect API](https://appstoreconnect.apple.com/access/integrations/api),
+     generate a **Team Key** with the **App Manager** role. Only the Account
+     Holder can request API access the first time.
+  2. The page shows the **Issuer ID** above the keys table and the **Key ID**
+     in the key's row.
+  3. Download the `AuthKey_<KEYID>.p8`. Apple offers it **once**; keep it
+     somewhere safe.
+
+  ```bash
+  base64 -i AuthKey_XXXXXXXXXX.p8 | gh secret set APPLE_API_KEY_BASE64
+  ```
+
+### Android signing
+
+- **`KEYSTORE_BASE64`, `KEYSTORE_PASSWORD`, `KEY_PASSWORD`, `KEY_ALIAS`** — an
+  upload keystore
+  ([Flutter](https://docs.flutter.dev/deployment/android#create-an-upload-keystore),
+  [Android](https://developer.android.com/studio/publish/app-signing#generate-key)):
+
+  ```bash
+  keytool -genkey -v -keystore upload-keystore.jks -storetype JKS \
+    -keyalg RSA -keysize 2048 -validity 10000 -alias upload
+  ```
+
+  The store password and key password `keytool` asks for are
+  `KEYSTORE_PASSWORD` and `KEY_PASSWORD`; the `-alias` is `KEY_ALIAS`; base64
+  of the `.jks` is `KEYSTORE_BASE64`. Back the keystore up: an app already
+  installed by testers only accepts updates signed with the same key.
+
+### Firebase App Distribution (`distribute-android`)
+
+The Android app has to be registered in a Firebase project, and App
+Distribution opened once in the console for it.
+
+- **`FIREBASE_ANDROID_APP_ID`** — in the
+  [Firebase console](https://console.firebase.google.com/), Project settings →
+  General → Your apps → the Android app's **App ID**, of the form
+  `1:1234567890:android:0a1b2c3d4e5f67890`
+  ([reference](https://firebase.google.com/docs/app-distribution/android/distribute-cli)).
+- **`FIREBASE_DISTRIBUTION_SERVICE_ACCOUNT`** — the whole JSON key of a
+  service account allowed to upload
+  ([Authenticate with a service account](https://firebase.google.com/docs/app-distribution/authenticate-service-account)).
+  1. In the Google Cloud console for the same project, IAM & Admin → Service
+     accounts → create one, and grant it **Firebase App Distribution Admin**.
+  2. On that account, Keys → Add key → JSON
+     ([Create and delete keys](https://cloud.google.com/iam/docs/keys-create-delete)).
+  3. `gh secret set FIREBASE_DISTRIBUTION_SERVICE_ACCOUNT < key.json`, then
+     delete the local file.
+- **Tester groups** are not a secret, but a build sent to a group alias that
+  does not exist fails. Create the groups under App Distribution → Testers &
+  Groups ([Manage testers](https://firebase.google.com/docs/app-distribution/manage-testers)):
+  either one aliased `default`, or set `default-firebase-groups` to an alias
+  you have.
+
+### Private Git dependencies
+
+- **`GIT_TOKEN`** — only when `pubspec.yaml` pulls packages from private
+  GitHub repositories. A
+  [fine-grained personal access token](https://docs.github.com/en/authentication/keeping-your-account-and-data-secure/managing-your-personal-access-tokens)
+  whose resource owner is the account or organisation that owns those
+  repositories, limited to them, with **Contents: read-only**. An organisation
+  may have to approve the token before it works.
+
 ## What the app has to provide
 
 - **`pubspec.yaml`** with `version: X.Y.Z+N` and the Flutter version under
