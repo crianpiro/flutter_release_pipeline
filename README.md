@@ -78,7 +78,12 @@ build-desktop-version                                desktop only — no bump, t
 ```
 
 Put the keywords in the **pull request title**, so a squash merge carries them
-onto the branch; the pull request description becomes the release notes. They
+onto the branch; the pull request description becomes the release notes.
+
+**HTML comments are ignored.** `<!-- … -->` is removed from the message before
+keywords are read and before the release notes are built. A pull request
+template can therefore keep its guidance, including example keywords, in
+comments: they neither start a release nor reach testers. They
 reach the GitHub release, Firebase testers and the TestFlight build's
 "What's New". The subject line is used when there is no body.
 

@@ -52,6 +52,23 @@ runs:
       run: |
         set -euo pipefail
 
+        # HTML comments are removed first, exactly as the pipeline does, so a
+        # pull request template can show "flavor: prod" as an example.
+        COMMIT_MESSAGE=$(printf '%s' "$COMMIT_MESSAGE" | perl -0777 -pe 's/<!--.*?-->//gs')
+
+        # The caller starts this job on the raw message. If the release
+        # keywords only appeared inside comments, nothing is released, so
+        # there is no flavor to insist on: the pipeline skips everything too.
+        if ! printf '%s' "$COMMIT_MESSAGE" |
+             grep -qiE '(^|[^-[:alnum:]])build-(desktop-)?version($|[^-[:alnum:]])'; then
+          {
+            echo "flavor="
+            echo "suffix="
+          } >> "$GITHUB_OUTPUT"
+          echo "[INFO] No release keyword outside HTML comments; no flavor needed."
+          exit 0
+        fi
+
         # "flavor: prod", "flavor:prod" or "Flavor: prod" anywhere in the
         # message; the name is the word that follows.
         named=$(

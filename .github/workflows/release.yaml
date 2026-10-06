@@ -250,12 +250,39 @@ jobs:
         run: |
           set -euo pipefail
 
+          # HTML comments are removed before anything reads the message. On a
+          # squash merge the pull request description becomes the commit body,
+          # and a pull request template keeps its guidance in comments: a
+          # keyword shown there as an example must not start a release, and
+          # the guidance must not reach testers as release notes. Only closed
+          # comments go, across lines; an unclosed "<!--" is left as text.
+          COMMIT_MESSAGE=$(printf '%s' "$COMMIT_MESSAGE" | perl -0777 -pe 's/<!--.*?-->//gs')
+
           # Keywords are matched on word boundaries, never as bare substrings,
           # so one keyword can never be found inside a longer one.
           has() {
             printf '%s' "$COMMIT_MESSAGE" |
               grep -qiE "(^|[^-[:alnum:]])$1(\$|[^-[:alnum:]])"
           }
+
+          # The job-level condition above reads the raw message, comments
+          # included, so a keyword that only appears in a comment still starts
+          # this job. Nothing is asked for, then: every later job is skipped
+          # on these outputs, and the run ends here without touching the
+          # version, the flavor or the entry point.
+          if ! has 'build-version' && ! has 'build-desktop-version'; then
+            {
+              echo "release_requested=false"
+              echo "build_ios=false"
+              echo "build_android=false"
+              echo "build_macos=false"
+              echo "build_windows=false"
+              echo "distribute_ios=false"
+              echo "distribute_android=false"
+            } >> "$GITHUB_OUTPUT"
+            echo "No release keyword outside HTML comments, so nothing is built." >> "$GITHUB_STEP_SUMMARY"
+            exit 0
+          fi
 
           # An explicit version may follow the keyword with up to three
           # separator characters: "build-version 1.4.0", "build-version: 1.4.0"
