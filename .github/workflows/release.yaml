@@ -1033,8 +1033,13 @@ jobs:
           name: ${{ env.ANDROID_ARTIFACT_NAME }}
           path: ./artifacts/
 
+      # v2, not v1: v1 pasted its inputs into the shell command, so release
+      # notes -- a pull request description, written by anyone who opens one
+      # -- ran as commands wherever they held backticks or $( ), and their
+      # line breaks split the command into stray arguments. v2 passes every
+      # input through the environment.
       - name: Distribute android artifact to Firebase
-        uses: crianpiro/distribute_to_firebase@v1
+        uses: crianpiro/distribute_to_firebase@v2
         with:
           artifact: "./artifacts/${{ env.ANDROID_ARTIFACT_NAME }}"
           app-id: ${{ secrets.FIREBASE_ANDROID_APP_ID }}
