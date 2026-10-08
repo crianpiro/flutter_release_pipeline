@@ -541,10 +541,35 @@ the Windows `.exe` raises a SmartScreen warning.
 
 ## Releasing this repository
 
-Callers pin a major tag (`@v1`). The workflow also references its own
-`ensure-yq` action by that tag, because a called workflow's `./` is the
-caller's checkout, not this repository. So:
+Each release gets two tags:
 
-- a compatible change moves the `v1` tag to the new commit;
-- a breaking change bumps every `@v1` inside `.github/workflows/release.yaml`
-  to `@v2` in the same commit, then tags `v2`.
+- a fixed version tag, `vMAJOR.MINOR.PATCH`, which never moves once it is
+  pushed and has a GitHub release with notes;
+- the major tag, `v1`, which moves to the newest fixed version of that major.
+
+Callers pin the major tag (`@v1`) and pick up every compatible release. A
+caller that needs to stay on a known release (for example, to step back after
+a release broke it) pins a fixed version instead (`@v1.0.0`).
+
+The workflow also references its own `ensure-yq` action by the major tag,
+because a called workflow's `./` is the caller's checkout, not this
+repository. A caller pinned to `@v1.0.0` therefore still gets the `ensure-yq`
+that `v1` points at today. Pinning a fixed version gives you that version's
+workflow, but not that version's `ensure-yq`.
+
+To release, from the merged commit on `main`:
+
+1. Choose the next version. Bump the patch for a fix, and the minor for
+   anything new that existing callers do not have to adopt.
+2. Tag it and push the tag:
+   `git tag -a v1.2.0 -m "v1.2.0" && git push origin v1.2.0`.
+3. Publish the release, listing what changed for callers:
+   `gh release create v1.2.0 --verify-tag --title v1.2.0 --notes-file notes.md`.
+4. Move the major tag:
+   `git tag -fa v1 -m "v1: reusable Flutter build & release workflow" v1.2.0^{} && git push --force origin v1`.
+
+A breaking change (a renamed or removed input, output or secret, or a
+different artifact name) starts a new major instead. In the same commit, bump
+every `@v1` inside `.github/workflows/release.yaml` to `@v2`. Then release it
+as `v2.0.0` and create the `v2` tag. `v1` stays where it is, so existing callers
+are not broken.
