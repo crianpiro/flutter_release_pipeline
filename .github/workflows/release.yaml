@@ -215,6 +215,10 @@ jobs:
       target: ${{ steps.version.outputs.target }}
       build_number: ${{ steps.version.outputs.build_number }}
       artifact_name: ${{ steps.version.outputs.artifact_name }}
+      ios_artifact_name: ${{ steps.version.outputs.ios_artifact_name }}
+      android_artifact_name: ${{ steps.version.outputs.android_artifact_name }}
+      macos_artifact_name: ${{ steps.version.outputs.macos_artifact_name }}
+      windows_artifact_name: ${{ steps.version.outputs.windows_artifact_name }}
       release_notes: ${{ steps.version.outputs.release_notes }}
       groups: ${{ steps.version.outputs.groups }}
       release_requested: ${{ steps.version.outputs.release_requested }}
@@ -490,6 +494,19 @@ jobs:
 
           tag=$TAG_PREFIX$version
 
+          # The file name of every artifact this run builds, and empty for a
+          # platform it does not. They are decided here, not in the build jobs,
+          # because GitHub drops a job output that contains the value of any
+          # secret that job was given -- and a build job is given signing
+          # secrets. A keystore alias equal to the artifact name was enough to
+          # empty the APK name, and the release job then downloaded every
+          # artifact instead of one. This job holds no signing secrets.
+          ios_artifact_name='' android_artifact_name='' macos_artifact_name='' windows_artifact_name=''
+          [[ $build_ios == true ]] && ios_artifact_name=$artifact_name-$version+$build_number.ipa
+          [[ $build_android == true ]] && android_artifact_name=$artifact_name-$version+$build_number.apk
+          [[ $build_macos == true ]] && macos_artifact_name=$artifact_name-macos-$version+$build_number.zip
+          [[ $build_windows == true ]] && windows_artifact_name=$artifact_name-windows-$version+$build_number.zip
+
           {
             echo "version=$version"
             echo "tag=$tag"
@@ -497,6 +514,10 @@ jobs:
             echo "target=$TARGET"
             echo "build_number=$build_number"
             echo "artifact_name=$artifact_name"
+            echo "ios_artifact_name=$ios_artifact_name"
+            echo "android_artifact_name=$android_artifact_name"
+            echo "macos_artifact_name=$macos_artifact_name"
+            echo "windows_artifact_name=$windows_artifact_name"
             echo "groups=$groups"
             echo "release_requested=$release_requested"
             echo "build_ios=$build_ios"
@@ -558,12 +579,10 @@ jobs:
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
-    outputs:
-      ios_artifact_name: ${{ steps.prepare_ios_artifact.outputs.ios_artifact_name }}
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
       BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
-      ARTIFACT_NAME: ${{ needs.resolve.outputs.artifact_name }}
+      IOS_ARTIFACT_NAME: ${{ needs.resolve.outputs.ios_artifact_name }}
       FLAVOR: ${{ needs.resolve.outputs.flavor }}
       TARGET: ${{ needs.resolve.outputs.target }}
       # Read by the credential helper defined at the top of this file, when
@@ -625,14 +644,12 @@ jobs:
         id: prepare_ios_artifact
         run: |
           set -euo pipefail
-          IPA_NAME=${ARTIFACT_NAME}-${VERSION}+${BUILD_NUMBER}.ipa
+          IPA_NAME=$IOS_ARTIFACT_NAME
           # To the workspace root, which upload-artifact resolves paths
           # against, whatever the app's directory. Every artifact job does
           # the same, so each uploads by its file name alone.
           # build_flutter_app names a flavored IPA app-<flavor>-release.ipa.
           mv "build/ios/ipa/app-${FLAVOR:+$FLAVOR-}release.ipa" "$GITHUB_WORKSPACE/$IPA_NAME"
-          echo "IOS_ARTIFACT_NAME=$IPA_NAME" >> "$GITHUB_ENV"
-          echo "ios_artifact_name=$IPA_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact to GitHub
         uses: actions/upload-artifact@v4
@@ -656,12 +673,10 @@ jobs:
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
-    outputs:
-      android_artifact_name: ${{ steps.prepare_android_artifact.outputs.android_artifact_name }}
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
       BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
-      ARTIFACT_NAME: ${{ needs.resolve.outputs.artifact_name }}
+      ANDROID_ARTIFACT_NAME: ${{ needs.resolve.outputs.android_artifact_name }}
       FLAVOR: ${{ needs.resolve.outputs.flavor }}
       TARGET: ${{ needs.resolve.outputs.target }}
       # Read by the credential helper defined at the top of this file, when
@@ -781,10 +796,8 @@ jobs:
         id: prepare_android_artifact
         run: |
           set -euo pipefail
-          APK_NAME=${ARTIFACT_NAME}-${VERSION}+${BUILD_NUMBER}.apk
+          APK_NAME=$ANDROID_ARTIFACT_NAME
           mv "build/app/outputs/flutter-apk/app-${FLAVOR:+$FLAVOR-}release.apk" "$GITHUB_WORKSPACE/$APK_NAME"
-          echo "ANDROID_ARTIFACT_NAME=$APK_NAME" >> "$GITHUB_ENV"
-          echo "android_artifact_name=$APK_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact to GitHub
         uses: actions/upload-artifact@v4
@@ -808,12 +821,10 @@ jobs:
     defaults:
       run:
         working-directory: ${{ inputs.working-directory }}
-    outputs:
-      macos_artifact_name: ${{ steps.prepare_macos_artifact.outputs.macos_artifact_name }}
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
       BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
-      ARTIFACT_NAME: ${{ needs.resolve.outputs.artifact_name }}
+      MACOS_ARTIFACT_NAME: ${{ needs.resolve.outputs.macos_artifact_name }}
       FLAVOR: ${{ needs.resolve.outputs.flavor }}
       TARGET: ${{ needs.resolve.outputs.target }}
       GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
@@ -889,10 +900,8 @@ jobs:
             ls "$products" || true
             exit 1
           fi
-          MACOS_NAME=${ARTIFACT_NAME}-macos-${VERSION}+${BUILD_NUMBER}.zip
+          MACOS_NAME=$MACOS_ARTIFACT_NAME
           ditto -c -k --sequesterRsrc --keepParent "${apps[0]}" "$GITHUB_WORKSPACE/$MACOS_NAME"
-          echo "MACOS_ARTIFACT_NAME=$MACOS_NAME" >> "$GITHUB_ENV"
-          echo "macos_artifact_name=$MACOS_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact to GitHub
         uses: actions/upload-artifact@v4
@@ -919,12 +928,10 @@ jobs:
         # of this file. Git for Windows provides bash on the hosted image.
         shell: bash
         working-directory: ${{ inputs.working-directory }}
-    outputs:
-      windows_artifact_name: ${{ steps.prepare_windows_artifact.outputs.windows_artifact_name }}
     env:
       VERSION: ${{ needs.resolve.outputs.version }}
       BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
-      ARTIFACT_NAME: ${{ needs.resolve.outputs.artifact_name }}
+      WINDOWS_ARTIFACT_NAME: ${{ needs.resolve.outputs.windows_artifact_name }}
       FLAVOR: ${{ needs.resolve.outputs.flavor }}
       TARGET: ${{ needs.resolve.outputs.target }}
       GIT_TOKEN: ${{ secrets.GIT_TOKEN }}
@@ -996,12 +1003,10 @@ jobs:
             ls -R build/windows || true
             exit 1
           fi
-          WINDOWS_NAME=${ARTIFACT_NAME}-windows-${VERSION}+${BUILD_NUMBER}.zip
+          WINDOWS_NAME=$WINDOWS_ARTIFACT_NAME
           # -r for the tree, and run from inside it so the archive has no
           # build/windows/x64/... prefix around the executable.
           (cd "$RELEASE_DIR" && 7z a -tzip -mx=5 "$GITHUB_WORKSPACE/$WINDOWS_NAME" .) > /dev/null
-          echo "WINDOWS_ARTIFACT_NAME=$WINDOWS_NAME" >> "$GITHUB_ENV"
-          echo "windows_artifact_name=$WINDOWS_NAME" >> "$GITHUB_OUTPUT"
 
       - name: Upload artifact to GitHub
         uses: actions/upload-artifact@v4
@@ -1025,7 +1030,7 @@ jobs:
     env:
       RELEASE_NOTES: ${{ needs.resolve.outputs.release_notes }}
       DISTRIBUTION_GROUPS: ${{ needs.resolve.outputs.groups }}
-      ANDROID_ARTIFACT_NAME: ${{ needs.build_android_artifact.outputs.android_artifact_name }}
+      ANDROID_ARTIFACT_NAME: ${{ needs.resolve.outputs.android_artifact_name }}
     steps:
       - name: Download android artifact
         uses: actions/download-artifact@v4
@@ -1053,7 +1058,7 @@ jobs:
     if: ${{ needs.resolve.outputs.distribute_ios == 'true' }}
     runs-on: ${{ (startsWith(inputs.macos-runner, '{') || startsWith(inputs.macos-runner, '[')) && fromJSON(inputs.macos-runner) || inputs.macos-runner }}
     env:
-      IOS_ARTIFACT_NAME: ${{ needs.build_ios_artifact.outputs.ios_artifact_name }}
+      IOS_ARTIFACT_NAME: ${{ needs.resolve.outputs.ios_artifact_name }}
     steps:
       - name: Download iOS artifact
         uses: actions/download-artifact@v4
@@ -1124,10 +1129,10 @@ jobs:
       VERSION: ${{ needs.resolve.outputs.version }}
       BUILD_NUMBER: ${{ needs.resolve.outputs.build_number }}
       RELEASE_NOTES: ${{ needs.resolve.outputs.release_notes }}
-      ANDROID_ARTIFACT_NAME: ${{ needs.build_android_artifact.outputs.android_artifact_name }}
-      IOS_ARTIFACT_NAME: ${{ needs.build_ios_artifact.outputs.ios_artifact_name }}
-      MACOS_ARTIFACT_NAME: ${{ needs.build_macos_artifact.outputs.macos_artifact_name }}
-      WINDOWS_ARTIFACT_NAME: ${{ needs.build_windows_artifact.outputs.windows_artifact_name }}
+      ANDROID_ARTIFACT_NAME: ${{ needs.resolve.outputs.android_artifact_name }}
+      IOS_ARTIFACT_NAME: ${{ needs.resolve.outputs.ios_artifact_name }}
+      MACOS_ARTIFACT_NAME: ${{ needs.resolve.outputs.macos_artifact_name }}
+      WINDOWS_ARTIFACT_NAME: ${{ needs.resolve.outputs.windows_artifact_name }}
     steps:
       - uses: actions/checkout@v4
         with:
