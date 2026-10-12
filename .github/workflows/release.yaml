@@ -1104,19 +1104,33 @@ jobs:
         distribute_artifact_to_firebase,
         distribute_artifact_to_app_store,
       ]
-    # Runs whether or not distribution was asked for, but never after a failed
-    # distribution: a release should not claim testers got something they did not.
+    # Runs whether or not distribution was asked for.
+    #
+    # A failed build holds the release back, deliberately: a release promising
+    # a build should not appear without it. A job that was not asked for -- a
+    # platform the app opted out of, or a desktop build nobody named --
+    # reports "skipped", not "failure", so it does not.
+    #
+    # A failed distribution holds the release back only when no distribution
+    # landed. Once one store has the build, testers there have it, so the
+    # version is spent and the tag and release must say so -- whatever
+    # happened to the other store. The run still fails, because the failed
+    # job fails it; the release job notes which distribution went wrong (see
+    # the last step), so the red run is not read as a lost release.
     #
     # A desktop-only run has no release to publish, so it stops here. The
     # desktop jobs it did run leave their artifacts on the workflow run.
-    #
-    # A job that was not asked for -- a platform the app opted out of, or a
-    # desktop build nobody named -- reports "skipped", not "failure", so it
-    # does not hold the release back. One that ran and failed does,
-    # deliberately: a release promising a build should not appear without it.
     if: >-
       ${{ !cancelled()
-      && !contains(needs.*.result, 'failure')
+      && needs.resolve.result == 'success'
+      && needs.build_ios_artifact.result != 'failure'
+      && needs.build_android_artifact.result != 'failure'
+      && needs.build_macos_artifact.result != 'failure'
+      && needs.build_windows_artifact.result != 'failure'
+      && (needs.distribute_artifact_to_firebase.result == 'success'
+          || needs.distribute_artifact_to_app_store.result == 'success'
+          || (needs.distribute_artifact_to_firebase.result != 'failure'
+              && needs.distribute_artifact_to_app_store.result != 'failure'))
       && needs.resolve.outputs.release_requested == 'true' }}
     runs-on: ${{ (startsWith(inputs.linux-runner, '{') || startsWith(inputs.linux-runner, '[')) && fromJSON(inputs.linux-runner) || inputs.linux-runner }}
     permissions:
@@ -1248,3 +1262,23 @@ jobs:
 
           url="${{ github.server_url }}/${{ github.repository }}/releases/tag/$TAG"
           echo "Released **$TAG+$BUILD_NUMBER** — [release]($url)" >> "$GITHUB_STEP_SUMMARY"
+
+      # Reached only when this release went out past a failed distribution
+      # (see the job's `if:`). The failed job already fails the run; this
+      # names the store that did not get the build, next to the release link,
+      # so the summary says what to do: redistribute that one build, not
+      # release again.
+      - name: Note the distributions that failed
+        if: ${{ contains(needs.*.result, 'failure') }}
+        env:
+          FIREBASE_RESULT: ${{ needs.distribute_artifact_to_firebase.result }}
+          APP_STORE_RESULT: ${{ needs.distribute_artifact_to_app_store.result }}
+        run: |
+          set -euo pipefail
+          note() {
+            echo "::warning::$TAG was released, but distribution to $1 failed. Testers there do not have this build."
+            echo "⚠️ Distribution to **$1** failed; $TAG was released without reaching it." >> "$GITHUB_STEP_SUMMARY"
+          }
+          [[ "$FIREBASE_RESULT" == failure ]] && note "Firebase"
+          [[ "$APP_STORE_RESULT" == failure ]] && note "App Store Connect"
+          true
