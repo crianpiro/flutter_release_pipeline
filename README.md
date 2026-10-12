@@ -96,6 +96,12 @@ Connect permanently refuses a build number it has seen. The bump is committed
 back to the branch and tagged `<tag-prefix>X.Y.Z` (`vX.Y.Z` by default) only
 after every artifact has built, so a failed build leaves nothing behind.
 
+A failed distribution is different. When one store rejects the build but the
+other accepted it, testers already have that version, so it is tagged and
+released all the same; the run still fails, and the release job's summary
+names the store that did not get the build. Only when no distribution landed
+does the failure hold the release back.
+
 A run fails early, before building anything, when:
 
 - the version is already in `pubspec.yaml` or already tagged;
