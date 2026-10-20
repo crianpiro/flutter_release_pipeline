@@ -26,7 +26,7 @@ concurrency:
 
 jobs:
   pipeline:
-    uses: crianpiro/flutter_release_pipeline/.github/workflows/release.yaml@v1
+    uses: crianpiro/flutter_release_pipeline/.github/workflows/release.yaml@v2
     # The release job pushes the version bump and the tag.
     permissions:
       contents: write
@@ -74,8 +74,17 @@ flavor: prod                                     the flavor to release (flavored
 build-version build-desktop-version                  ...also attach macOS and Windows builds
 build-version build-desktop-version desktop-macos    ...macOS only
 build-version build-desktop-version desktop-windows  ...Windows only
-build-desktop-version                                desktop only — no bump, tag or release
+
+build-desktop-version                                desktop release: build macOS and Windows, tag, release
+build-desktop-version 1.4.0                          ...at a version you name
+build-desktop-version desktop-macos                  ...macOS only
+build-desktop-version desktop-windows                ...Windows only
 ```
+
+Either `build-version` or `build-desktop-version` bumps the version, tags and
+publishes a GitHub release. Mobile is built only on `build-version`, so a
+desktop release carries only its desktop artifacts; the iOS and Android files
+stay on the release that built them.
 
 Put the keywords in the **pull request title**, so a squash merge carries them
 onto the branch; the pull request description becomes the release notes.
@@ -90,9 +99,10 @@ reach the GitHub release, Firebase testers and the TestFlight build's
 ### Versioning
 
 `pubspec.yaml` holds the version (`X.Y.Z+N`) and stays the single source of
-truth. A version named after `build-version` is written there; with none, the
-patch is bumped. The build number increments either way, because App Store
-Connect permanently refuses a build number it has seen. The bump is committed
+truth. A version named after `build-version` (or `build-desktop-version`) is
+written there; with none, the patch is bumped. The build number increments
+either way, because App Store Connect permanently refuses a build number it
+has seen. The bump is committed
 back to the branch and tagged `<tag-prefix>X.Y.Z` (`vX.Y.Z` by default) only
 after every artifact has built, so a failed build leaves nothing behind.
 
@@ -106,13 +116,17 @@ A run fails early, before building anything, when:
 
 - the version is already in `pubspec.yaml` or already tagged;
 - a keyword names a version other than the one being built
-  (`build-version 1.0.7 distribute-ios 1.0.5`);
-- distribution is asked for a platform the app has opted out of;
+  (`build-version 1.0.7 distribute-ios 1.0.5`, or
+  `build-version 1.0.7 build-desktop-version 1.0.8`);
+- distribution is asked for a platform the app has opted out of, or without
+  `build-version` (a desktop release builds no mobile artifact to ship);
 - a release would contain no artifact at all;
 - the `groups:` line is not a comma-separated list of aliases.
 
-`build-desktop-version` alone builds what `pubspec.yaml` already says and
-consumes no version number; its artifacts stay on the workflow run.
+`build-desktop-version` alone is a release like any other: it bumps, tags and
+releases under the same rules, with only the desktop builds it made attached.
+(Before v2 it built what `pubspec.yaml` already said and released nothing; see
+[Changes in v2](#changes-in-v2).)
 
 ### Platforms
 
@@ -178,7 +192,7 @@ concurrency:
 
 jobs:
   pipeline:
-    uses: crianpiro/flutter_release_pipeline/.github/workflows/release.yaml@v1
+    uses: crianpiro/flutter_release_pipeline/.github/workflows/release.yaml@v2
     permissions:
       contents: write
     with:
@@ -265,14 +279,14 @@ jobs:
       suffix: ${{ steps.flavor.outputs.suffix }}
     steps:
       - id: flavor
-        uses: crianpiro/flutter_release_pipeline/.github/actions/resolve-flavor@v1
+        uses: crianpiro/flutter_release_pipeline/.github/actions/resolve-flavor@v2
         with:
           flavors: dev, prod
           # default-flavor: prod   # for commits that name no flavor
 
   pipeline:
     needs: flavor
-    uses: crianpiro/flutter_release_pipeline/.github/workflows/release.yaml@v1
+    uses: crianpiro/flutter_release_pipeline/.github/workflows/release.yaml@v2
     permissions:
       contents: write
     with:
@@ -551,16 +565,17 @@ Each release gets two tags:
 
 - a fixed version tag, `vMAJOR.MINOR.PATCH`, which never moves once it is
   pushed and has a GitHub release with notes;
-- the major tag, `v1`, which moves to the newest fixed version of that major.
+- the major tag, `v2`, which moves to the newest fixed version of that major
+  (`v1` stays on the last v1 release).
 
-Callers pin the major tag (`@v1`) and pick up every compatible release. A
+Callers pin the major tag (`@v2`) and pick up every compatible release. A
 caller that needs to stay on a known release (for example, to step back after
-a release broke it) pins a fixed version instead (`@v1.0.0`).
+a release broke it) pins a fixed version instead (`@v2.0.0`).
 
 The workflow also references its own `ensure-yq` action by the major tag,
 because a called workflow's `./` is the caller's checkout, not this
-repository. A caller pinned to `@v1.0.0` therefore still gets the `ensure-yq`
-that `v1` points at today. Pinning a fixed version gives you that version's
+repository. A caller pinned to `@v2.0.0` therefore still gets the `ensure-yq`
+that `v2` points at today. Pinning a fixed version gives you that version's
 workflow, but not that version's `ensure-yq`.
 
 To release, from the merged commit on `main`:
@@ -568,14 +583,38 @@ To release, from the merged commit on `main`:
 1. Choose the next version. Bump the patch for a fix, and the minor for
    anything new that existing callers do not have to adopt.
 2. Tag it and push the tag:
-   `git tag -a v1.2.0 -m "v1.2.0" && git push origin v1.2.0`.
+   `git tag -a v2.1.0 -m "v2.1.0" && git push origin v2.1.0`.
 3. Publish the release, listing what changed for callers:
-   `gh release create v1.2.0 --verify-tag --title v1.2.0 --notes-file notes.md`.
+   `gh release create v2.1.0 --verify-tag --title v2.1.0 --notes-file notes.md`.
 4. Move the major tag:
-   `git tag -fa v1 -m "v1: reusable Flutter build & release workflow" v1.2.0^{} && git push --force origin v1`.
+   `git tag -fa v2 -m "v2: reusable Flutter build & release workflow" v2.1.0^{} && git push --force origin v2`.
 
 A breaking change (a renamed or removed input, output or secret, or a
 different artifact name) starts a new major instead. In the same commit, bump
-every `@v1` inside `.github/workflows/release.yaml` to `@v2`. Then release it
-as `v2.0.0` and create the `v2` tag. `v1` stays where it is, so existing callers
+every `@v2` inside `.github/workflows/release.yaml` to `@v3`. Then release it
+as `v3.0.0` and create the `v3` tag. `v2` stays where it is, so existing callers
 are not broken.
+
+### Changes in v2
+
+**`build-desktop-version` alone now releases.** On `@v1` a commit with
+`build-desktop-version` and no `build-version` built desktop at the version
+`pubspec.yaml` already held and stopped there: no bump, no tag, no release, and
+the artifacts stayed on the workflow run. On `@v2` it is a release like
+`build-version`:
+
+- it bumps the patch and the build number, or takes a version you name
+  (`build-desktop-version 2.1.0`), and fails early if that version is already
+  in `pubspec.yaml` or tagged;
+- it commits the bump, tags it and publishes a GitHub release carrying only
+  the desktop builds it made (`desktop-macos` / `desktop-windows` still pick
+  one); the previous release keeps the iOS and Android files;
+- `distribute-ios` / `distribute-android` without `build-version` is now an
+  error, since there is no mobile build to ship.
+
+Nothing else changes: mobile is still built only on `build-version`, and a
+run with both keywords behaves as on v1.
+
+To migrate, change `@v1` to `@v2` in the caller (and in `resolve-flavor@v1`, if
+used). Stay on `@v1` if desktop-only runs must keep building without
+releasing; `v1` is not moved by v2 releases.

@@ -153,7 +153,7 @@ on:
         description: The flavor this run built, empty for an app without flavors.
         value: ${{ jobs.resolve.outputs.flavor }}
       release_requested:
-        description: Whether the commit asked for a release ("build-version").
+        description: Whether the commit asked for a release ("build-version" or "build-desktop-version").
         value: ${{ jobs.resolve.outputs.release_requested }}
 
 # Git configuration for every job, supplied through the environment so that it
@@ -190,10 +190,11 @@ env:
 jobs:
   resolve:
     name: Resolve version
-    # Either keyword starts a run. Neither contains the other as a substring,
-    # so "build-desktop-version" alone never releases, and "build-version"
-    # alone never builds desktop. `github` is the caller's context here, so
-    # this is the commit that triggered the app repository's workflow.
+    # Either keyword starts a run, and either asks for a release. Neither
+    # contains the other as a substring, so "build-desktop-version" alone
+    # never builds mobile, and "build-version" alone never builds desktop.
+    # `github` is the caller's context here, so this is the commit that
+    # triggered the app repository's workflow.
     if: >-
       contains(github.event.head_commit.message, 'build-version') ||
       contains(github.event.head_commit.message, 'build-desktop-version')
@@ -288,12 +289,14 @@ jobs:
             exit 0
           fi
 
-          # An explicit version may follow the keyword with up to three
-          # separator characters: "build-version 1.4.0", "build-version: 1.4.0"
-          # and "build-version(1.4.0)" all pin 1.4.0.
+          # An explicit version may follow either release keyword with up to
+          # three separator characters: "build-version 1.4.0",
+          # "build-version: 1.4.0", "build-version(1.4.0)" and
+          # "build-desktop-version 1.4.0" all pin 1.4.0. When both keywords
+          # name one, the check further down holds them to the same version.
           version=$(
             printf '%s' "$COMMIT_MESSAGE" \
-              | grep -oiE 'build-version[^0-9]{0,3}[0-9]+\.[0-9]+\.[0-9]+' \
+              | grep -oiE 'build-(desktop-)?version[^0-9]{0,3}[0-9]+\.[0-9]+\.[0-9]+' \
               | grep -oE '[0-9]+\.[0-9]+\.[0-9]+' \
               | head -1 \
               || true
@@ -358,52 +361,43 @@ jobs:
             exit 1
           fi
 
-          # "build-version" is what asks for a release: the version bump, the
-          # mobile artifacts, the tag and the GitHub release. Without it this
-          # run only builds desktop, and must leave the version alone -- see
-          # the branch below.
-          if has 'build-version'; then release_requested=true; else release_requested=false; fi
+          # Either keyword asks for a release: the version bump, the tag and
+          # the GitHub release, carrying whatever this run built. Every run
+          # that gets this far releases -- the early exit above is the only
+          # way out without one -- but the output stays, because callers read
+          # it.
+          release_requested=true
 
-          if [[ "$release_requested" == true ]]; then
-            # Without an explicit version, bump the patch of the one in pubspec.
-            # A minor or major release is named in the commit message instead --
-            # that keeps one rule here rather than three keywords.
-            if [[ -z "$version" ]]; then
-              IFS=. read -r major minor patch <<<"$current_version"
-              version="$major.$minor.$((patch + 1))"
-            fi
-
-            # The build number always moves, including when the version is named
-            # explicitly: App Store Connect refuses a build number it has already
-            # seen, for that version, permanently.
-            build_number=$((current_build + 1))
-
-            if [[ "$version" == "$current_version" ]]; then
-              echo "::error::pubspec.yaml is already at $version. Name a different version in the commit message."
-              exit 1
-            fi
-
-            if existing=$(git rev-list -n1 "refs/tags/$TAG_PREFIX$version" 2>/dev/null); then
-              echo "::error::$TAG_PREFIX$version already tags ${existing:0:7}. Name a different version in the commit message."
-              exit 1
-            fi
-          else
-            # A desktop-only run publishes nothing and must not consume a
-            # version number, because the next release derives its own from
-            # what pubspec.yaml says. So it builds exactly what is already
-            # there, and the two guards above are deliberately skipped: pubspec
-            # IS at this version, and this version IS already tagged -- both
-            # are correct here rather than errors.
-            version=$current_version
-            build_number=$current_build
+          # Without an explicit version, bump the patch of the one in pubspec.
+          # A minor or major release is named in the commit message instead --
+          # that keeps one rule here rather than three keywords.
+          if [[ -z "$version" ]]; then
+            IFS=. read -r major minor patch <<<"$current_version"
+            version="$major.$minor.$((patch + 1))"
           fi
 
-          # Mobile is opt-out per app, through the `ios` and `android` inputs:
-          # a release builds every mobile platform the app has. It is not a
-          # per-commit choice, because the release always carries the full set.
+          # The build number always moves, including when the version is named
+          # explicitly: App Store Connect refuses a build number it has already
+          # seen, for that version, permanently.
+          build_number=$((current_build + 1))
+
+          if [[ "$version" == "$current_version" ]]; then
+            echo "::error::pubspec.yaml is already at $version. Name a different version in the commit message."
+            exit 1
+          fi
+
+          if existing=$(git rev-list -n1 "refs/tags/$TAG_PREFIX$version" 2>/dev/null); then
+            echo "::error::$TAG_PREFIX$version already tags ${existing:0:7}. Name a different version in the commit message."
+            exit 1
+          fi
+
+          # Mobile is opt-out per app, through the `ios` and `android` inputs,
+          # and built only on "build-version": a desktop release
+          # ("build-desktop-version" alone) carries only desktop artifacts,
+          # and the mobile ones stay on the release that built them.
           build_ios=false
           build_android=false
-          if [[ "$release_requested" == true ]]; then
+          if has 'build-version'; then
             build_ios=$IOS_ENABLED
             build_android=$ANDROID_ENABLED
           fi
@@ -427,8 +421,10 @@ jobs:
           fi
 
           # A release with no artifact would tag and publish an empty release.
-          if [[ "$release_requested" == true && "$build_ios$build_android$build_macos$build_windows" != *true* ]]; then
-            echo "::error::This app builds neither iOS nor Android, so a release needs \"build-desktop-version\" as well -- otherwise it would publish nothing."
+          # Desktop always builds something when asked for, so this is
+          # "build-version" alone in an app with ios: false and android: false.
+          if [[ "$build_ios$build_android$build_macos$build_windows" != *true* ]]; then
+            echo "::error::This app builds neither iOS nor Android, so \"build-version\" alone would release nothing. Add \"build-desktop-version\" to release desktop builds."
             exit 1
           fi
 
@@ -447,6 +443,16 @@ jobs:
             echo "::error::distribute-android was asked for, but this app is configured with android: false."
             exit 1
           fi
+
+          # Mobile is built only on "build-version", so distributing on a
+          # desktop release would ship nothing -- the distribution job would
+          # be skipped and the release go out as if it had not been asked for.
+          for keyword in distribute-ios distribute-android; do
+            if has "$keyword" && ! has 'build-version'; then
+              echo "::error::$keyword was asked for without \"build-version\". Mobile is built only on \"build-version\"; add it to build and ship this version."
+              exit 1
+            fi
+          done
 
           # Tester groups for Firebase. "groups: qa, management" anywhere in the
           # commit message names them for this release; the list runs to the end
@@ -467,10 +473,10 @@ jobs:
           # "distribute-ios 1.0.5" alongside "build-version 1.0.7" is someone
           # expecting to ship a different version than the one being built.
           # This ships what it builds, so that has to be an error rather than a
-          # quiet surprise. The same applies to "build-desktop-version": the
-          # desktop artifacts carry the version this run resolved, so naming
-          # another one is a misunderstanding worth failing on.
-          for keyword in distribute-ios distribute-android build-desktop-version; do
+          # quiet surprise. The same holds between the two release keywords:
+          # "build-version 1.0.7 build-desktop-version 1.0.8" asks for two
+          # versions, and a run builds one.
+          for keyword in build-version build-desktop-version distribute-ios distribute-android; do
             requested=$(
               printf '%s' "$COMMIT_MESSAGE" \
                 | grep -oiE "${keyword}[^0-9]{0,3}[0-9]+\.[0-9]+\.[0-9]+" \
@@ -555,20 +561,15 @@ jobs:
           desktop=$(join "$([[ $build_macos == true ]] && echo 'macOS')" \
                          "$([[ $build_windows == true ]] && echo 'Windows')")
 
-          if [[ "$release_requested" != true ]]; then
-            # Nothing is bumped, tagged or released, so the summary says which
-            # version the artifacts carry -- it is the one already released,
-            # and that is easy to misread as a new one.
-            echo "Building desktop **$tag+$build_number** ($desktop) from \`${GITHUB_SHA:0:7}\` — artifacts attach to this run; nothing is bumped, tagged or released" >> "$GITHUB_STEP_SUMMARY"
+          line="Building **$tag+$build_number** ($(join "$mobile" "$desktop")) from \`${GITHUB_SHA:0:7}\`"
+          if [[ -n "$targets" ]]; then
+            echo "$line, distributing to $targets" >> "$GITHUB_STEP_SUMMARY"
+          elif [[ -n "$mobile" ]]; then
+            echo "$line — no distribution (add \`distribute-ios\` and/or \`distribute-android\` to ship it)" >> "$GITHUB_STEP_SUMMARY"
           else
-            line="Building **$tag+$build_number** ($(join "$mobile" "$desktop")) from \`${GITHUB_SHA:0:7}\`"
-            if [[ -n "$targets" ]]; then
-              echo "$line, distributing to $targets" >> "$GITHUB_STEP_SUMMARY"
-            elif [[ -n "$mobile" ]]; then
-              echo "$line — no distribution (add \`distribute-ios\` and/or \`distribute-android\` to ship it)" >> "$GITHUB_STEP_SUMMARY"
-            else
-              echo "$line" >> "$GITHUB_STEP_SUMMARY"
-            fi
+            # A desktop release: say so, because the mobile files stay on the
+            # previous release and the new one is easy to misread as complete.
+            echo "$line — desktop release; iOS and Android stay on the previous release" >> "$GITHUB_STEP_SUMMARY"
           fi
 
   build_ios_artifact:
@@ -624,7 +625,7 @@ jobs:
       # relative path -- `./` is the caller's checkout -- so this names the
       # repository and the major version tag. Move it with every new major.
       - name: Ensure yq is available
-        uses: crianpiro/flutter_release_pipeline/.github/actions/ensure-yq@v1
+        uses: crianpiro/flutter_release_pipeline/.github/actions/ensure-yq@v2
 
       # build_flutter_app runs its own `flutter pub get` and has no option to
       # enforce the lockfile, so `enforce-lockfile` does not reach this job.
@@ -736,7 +737,7 @@ jobs:
       # flutter-action parses pubspec.yaml with yq, which self-hosted runners
       # often do not provide. See .github/actions/ensure-yq.
       - name: Ensure yq is available
-        uses: crianpiro/flutter_release_pipeline/.github/actions/ensure-yq@v1
+        uses: crianpiro/flutter_release_pipeline/.github/actions/ensure-yq@v2
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -833,8 +834,7 @@ jobs:
 
       # Same as the mobile jobs: the version reaches the build through
       # pubspec.yaml rather than --build-name, so every platform reads it from
-      # one place. On a desktop-only run resolve hands back what pubspec
-      # already says, so this rewrites the line with its own value.
+      # one place.
       - name: Set the build version
         run: |
           set -euo pipefail
@@ -857,7 +857,7 @@ jobs:
           printf '%s' "$ENV_FILE" > "$ENV_FILE_PATH"
 
       - name: Ensure yq is available
-        uses: crianpiro/flutter_release_pipeline/.github/actions/ensure-yq@v1
+        uses: crianpiro/flutter_release_pipeline/.github/actions/ensure-yq@v2
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -962,7 +962,7 @@ jobs:
       # A no-op on the hosted image, which ships yq; here for a self-hosted
       # Windows runner, which likely does not.
       - name: Ensure yq is available
-        uses: crianpiro/flutter_release_pipeline/.github/actions/ensure-yq@v1
+        uses: crianpiro/flutter_release_pipeline/.github/actions/ensure-yq@v2
 
       - name: Setup Flutter
         uses: subosito/flutter-action@v2
@@ -1118,8 +1118,9 @@ jobs:
     # job fails it; the release job notes which distribution went wrong (see
     # the last step), so the red run is not read as a lost release.
     #
-    # A desktop-only run has no release to publish, so it stops here. The
-    # desktop jobs it did run leave their artifacts on the workflow run.
+    # A desktop release ("build-desktop-version" alone) goes through the same
+    # rule: its mobile jobs and distributions are skipped, so only its desktop
+    # builds decide.
     if: >-
       ${{ !cancelled()
       && needs.resolve.result == 'success'
@@ -1198,7 +1199,8 @@ jobs:
       # failed build leaves no version bump behind to explain.
       #
       # [skip ci] is belt and braces. The keyword gate already means this commit
-      # cannot retrigger the workflow, since its message carries no "build-version".
+      # cannot retrigger the workflow, since its message carries neither
+      # "build-version" nor "build-desktop-version".
       - name: Commit the version bump and tag the release
         run: |
           set -euo pipefail
