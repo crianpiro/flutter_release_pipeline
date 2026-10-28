@@ -157,7 +157,7 @@ always opt-in.
 | `artifact-name` | repository name | Prefix of every artifact file: `<name>-1.4.0+12.ipa`, `<name>-macos-1.4.0+12.zip`. |
 | `java-version` | `17` | JDK for the Android build. |
 | `env-file` | empty | A file the app bundles but doesn't commit, such as `.env`, relative to `working-directory`. Each build job writes the `ENV_FILE` secret into it before building, and deletes it when the job ends. |
-| `enforce-lockfile` | `true` | Install with `flutter pub get --enforce-lockfile`. Set `false` if the app does not commit `pubspec.lock`. Not applied to the iOS job, whose dependencies are installed inside `crianpiro/build_flutter_app`. |
+| `enforce-lockfile` | `true` | Install with `flutter pub get --enforce-lockfile`. Set `false` if the app does not commit `pubspec.lock`. The iOS job passes it on to `crianpiro/build_flutter_app`, which installs its dependencies itself and honours it from v2.2.0. |
 | `refresh-cocoapods` | `true` | Run `pod repo update` before the macOS build. A stale index reports "could not find compatible versions for pod X", which reads like a dependency conflict. |
 | `uses-non-exempt-encryption` | `false` | The export-compliance answer posted to App Store Connect. |
 | `default-firebase-groups` | `default` | Firebase group aliases used when the commit has no `groups:` line. |
