@@ -627,12 +627,14 @@ jobs:
       - name: Ensure yq is available
         uses: crianpiro/flutter_release_pipeline/.github/actions/ensure-yq@v2
 
-      # build_flutter_app runs its own `flutter pub get` and has no option to
-      # enforce the lockfile, so `enforce-lockfile` does not reach this job.
+      # build_flutter_app runs its own `flutter pub get`, so the lockfile
+      # setting goes to it as an input. It has one from v2.2.0; a v2 tag
+      # older than that ignores it with a warning and installs without it.
       - name: Build iOS artifact
         uses: crianpiro/build_flutter_app@v2
         with:
           working-directory: ${{ inputs.working-directory }}
+          enforce-lockfile: ${{ inputs.enforce-lockfile }}
           flavor: ${{ env.FLAVOR }}
           target: ${{ env.TARGET }}
           certificate-base64: ${{ secrets.P12_BASE64 }}
