@@ -981,7 +981,9 @@ jobs:
       #
       # Flutter's --flavor covers Android, iOS and macOS only, so a flavored
       # Windows build is the flavor's entry point alone, and appFlavor reads
-      # null there.
+      # null there. Newer Flutter (3.47 on) does read the pubspec's
+      # default-flavor on Windows, though, and nests the output one level
+      # deeper: build/windows/<arch>/<flavor>/runner/Release.
       - name: Build Windows artifact
         run: flutter build windows --release --target "$TARGET"
 
@@ -989,19 +991,21 @@ jobs:
       # Flutter DLLs and the data/ folder beside it or it will not start. The
       # tree is zipped here rather than handed to upload-artifact as a
       # directory, so that the release carries one file per platform. The
-      # architecture directory (x64, arm64) is matched rather than assumed.
+      # architecture directory (x64, arm64) is matched rather than assumed, and
+      # so is the flavor directory newer Flutter puts under it.
       - name: Prepare Windows artifact
         id: prepare_windows_artifact
         run: |
           set -euo pipefail
-          dirs=(build/windows/*/runner/Release)
-          RELEASE_DIR=${dirs[0]}
+          shopt -s nullglob
+          dirs=(build/windows/*/runner/Release build/windows/*/*/runner/Release)
+          RELEASE_DIR=${dirs[0]:-}
           exes=()
           if [[ -d "$RELEASE_DIR" ]]; then
             while IFS= read -r exe; do exes+=("$exe"); done < <(find "$RELEASE_DIR" -maxdepth 1 -name '*.exe')
           fi
           if (( ${#dirs[@]} != 1 || ${#exes[@]} != 1 )); then
-            echo "::error::Expected one build/windows/<arch>/runner/Release holding exactly one .exe."
+            echo "::error::Expected one build/windows/<arch>[/<flavor>]/runner/Release holding exactly one .exe."
             ls -R build/windows || true
             exit 1
           fi

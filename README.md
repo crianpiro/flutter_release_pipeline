@@ -356,7 +356,9 @@ know the flavor by exactly that name.
 - **Windows** — Flutter's `--flavor` covers Android, iOS and macOS only. A
   flavored Windows build compiles the flavor's entry point and nothing more,
   so anything the flavor changes must come from that entry point; `appFlavor`
-  reads `null` there.
+  reads `null` there. From Flutter 3.47 a `default-flavor` in the pubspec puts
+  the build in `build/windows/<arch>/<flavor>/runner/Release/` instead of
+  `build/windows/<arch>/runner/Release/`; the pipeline accepts either.
 - **Firebase** — each flavor's Android application id is a separate app in
   Firebase, so each has its own `FIREBASE_ANDROID_APP_ID_<FLAVOR>`. If the
   flavors live in different Firebase projects, the service account and the
